@@ -53,3 +53,11 @@ world_size: 1
 resume_mode: 0
 # other
 save_format: pdf
+
+# round log / phase-one validation
+round_log_dir: ./output/round_log
+validation_response: zero_change
+submodel_validation_atol: 0.0
+submodel_validation_rtol: 0.0
+# enable/disbale RMA attack
+enable_rma_attack: true

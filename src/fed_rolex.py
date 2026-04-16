@@ -3,6 +3,7 @@ import torch
 import numpy as np
 from config import cfg
 from collections import OrderedDict
+from round_log import hash_state_dict
 
 
 
@@ -30,6 +31,30 @@ class Federation:
         else:
             raise ValueError('Not valid model split mode')
         return
+    
+    def build_round_manifest(self, user_idx):
+        active_users = [int(u) for u in user_idx]
+        active_user_model_rates = {
+            str(int(u)): float(self.model_rate[int(u)]) for u in active_users
+        }
+
+        manifest = {
+            "round": int(self.rd),
+            "global_model_hash": hash_state_dict(self.global_parameters),
+            "model_name": cfg["model_name"],
+            "model_split_mode": cfg["model_split_mode"],
+            "global_model_rate": float(cfg["global_model_rate"]),
+            "active_users": active_users,
+            "active_user_model_rates": active_user_model_rates,
+            "schedule": {
+                "rolling_offset": int(self.rd - 1),
+                "target_weights": list(self.target_weights),
+                "target_weights_fcnn": list(self.target_weights_fcnn),
+                "target_biases": list(self.target_biases),
+                "target_biases_fcnn": list(self.target_biases_fcnn),
+            },
+        }
+        return manifest
 
     def split_model(self, user_idx):
         if cfg['model_name'] == 'fcnn':
@@ -59,7 +84,7 @@ class Federation:
                                     output_idx_i_m = torch.arange(output_size, device=v.device)[:local_output_size]
 
                                 if k in self.target_weights_fcnn:
-                                    if self.model_rate[user_idx[m]] == 0.25 and self.rd == 2:
+                                    if cfg['enable_rma_attack'] and self.model_rate[user_idx[m]] == 0.25 and self.rd == 2:
                                         # Assign this client the malicious weights. 
                                         output_idx_i_m = (output_idx_i_m + int((self.model_rate[user_idx[m]]) * v.size()[0])) % v.size()[0]
                                         (output_idx_i_m, sorted_indeces) = torch.sort(output_idx_i_m)
@@ -238,7 +263,7 @@ class Federation:
                     else:
                         local_parameters[m][k] = copy.deepcopy(v[param_idx[m][k]])
 
-                    if self.model_rate[user_idx[m]] == 0.25:
+                    if cfg['enable_rma_attack'] and self.model_rate[user_idx[m]] == 0.25:
                         if k == 'layers.0.weight': # Need to do torch cat. 
                             updated_size = (int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])), v.size()[1])
                             self.initialize_weights(updated_size, k)
@@ -281,6 +306,61 @@ class Federation:
         # local_parameters: An array indexed by user_idx, which maps a key (e.g. blocks.weight.0 to its corresponding value (subset of global value))
         # param_idx: What is returned from split model (i.e. the indeces of which parameters to keep for a given layer). 
         return local_parameters, param_idx
+    
+
+    def extract_expected_local_parameters(self, parent_parameters, param_idx_for_user):
+        """
+        Reconstruct the expected local submodel from a committed parent/global model
+        and the exact extraction indices for one user.
+
+        parent_parameters: OrderedDict (full parent/global model state_dict)
+        param_idx_for_user: OrderedDict for one user, i.e. param_idx[m]
+        """
+        expected_local_parameters = OrderedDict()
+
+        for k, v in parent_parameters.items():
+            parameter_type = k.split('.')[-1]
+
+            if 'weight' in parameter_type or 'bias' in parameter_type:
+                if 'weight' in parameter_type:
+                    if v.dim() > 1:
+                        expected_local_parameters[k] = copy.deepcopy(
+                            v[torch.meshgrid(param_idx_for_user[k], indexing='ij')]
+                        )
+                    else:
+                        expected_local_parameters[k] = copy.deepcopy(v[param_idx_for_user[k]])
+                else:
+                    expected_local_parameters[k] = copy.deepcopy(v[param_idx_for_user[k]])
+            else:
+                # non-sliced parameters are copied as-is
+                expected_local_parameters[k] = copy.deepcopy(v)
+
+        return expected_local_parameters
+
+    def compare_local_parameters(self, expected_local_parameters, received_local_parameters, atol=0.0, rtol=0.0):
+        """
+        Compare two local state_dicts and return (is_valid, reason).
+        """
+        expected_keys = set(expected_local_parameters.keys())
+        received_keys = set(received_local_parameters.keys())
+
+        if expected_keys != received_keys:
+            missing = sorted(list(expected_keys - received_keys))
+            extra = sorted(list(received_keys - expected_keys))
+            return False, f"parameter-key mismatch; missing={missing}, extra={extra}"
+
+        for k in expected_local_parameters.keys():
+            exp_t = expected_local_parameters[k].detach().cpu()
+            rec_t = received_local_parameters[k].detach().cpu()
+
+            if exp_t.shape != rec_t.shape:
+                return False, f"shape mismatch on {k}: expected {tuple(exp_t.shape)}, got {tuple(rec_t.shape)}"
+
+            if not torch.allclose(exp_t, rec_t, atol=atol, rtol=rtol):
+                diff = torch.max(torch.abs(exp_t - rec_t)).item()
+                return False, f"value mismatch on {k}; max_abs_diff={diff}"
+
+        return True, "ok"
 
     def generate_pts(self, num_elements, down_scale_factor=0.95, mu=0.0, sigma=0.5):
         vector = np.random.normal(mu, sigma, num_elements)

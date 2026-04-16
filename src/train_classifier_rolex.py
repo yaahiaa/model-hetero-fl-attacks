@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from torchvision import transforms
+from round_log import TransparencyLog, hash_json
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 cudnn.benchmark = True
@@ -46,6 +47,43 @@ cfg['file_output'] = "New_Tables/MNIST_Rolex_TEST"
 full_path = os.getcwd() + "/" + cfg['file_output']
 fp = open(full_path, 'w')
 fp.write("N Max_Pearson Max_PSNR Max_Recovered\n")
+
+def sample_active_users():
+    num_active_users = int(np.ceil(cfg['frac'] * cfg['num_users']))
+    return torch.arange(cfg['num_users'])[torch.randperm(cfg['num_users'])[:num_active_users]].tolist()
+
+
+def validate_logged_round(user_id, expected_rate, round_log, server_manifest, server_checkpoint, previous_checkpoint):
+    latest_entry = round_log.get_latest_entry()
+    if latest_entry is None:
+        return False, "round log is empty"
+
+    log_manifest = latest_entry["manifest"]
+    log_checkpoint = latest_entry["checkpoint"]
+
+    # Client queries the log directly and checks the server-provided
+    # metadata against the independently observed latest log state.
+    if hash_json(server_manifest) != hash_json(log_manifest):
+        return False, "server manifest differs from log manifest"
+
+    if server_checkpoint != log_checkpoint:
+        return False, "server checkpoint differs from latest log checkpoint"
+
+    if not round_log.verify_manifest_against_checkpoint(server_manifest, server_checkpoint):
+        return False, "checkpoint does not authenticate manifest"
+
+    if previous_checkpoint is not None and not round_log.verify_checkpoint_extension(previous_checkpoint, server_checkpoint):
+        return False, "checkpoint is stale or does not extend prior local checkpoint"
+
+    active_users = server_manifest["active_users"]
+    if int(user_id) not in active_users:
+        return False, f"user {user_id} not listed as active in manifest"
+
+    logged_rate = float(server_manifest["active_user_model_rates"][str(int(user_id))])
+    if not np.isclose(logged_rate, float(expected_rate)):
+        return False, f"expected rate {expected_rate}, but log says {logged_rate}"
+
+    return True, "ok"
 
 
 def main():
@@ -90,6 +128,9 @@ def runExperiment():
         data_split, label_split = split_dataset(dataset, cfg['num_users'], cfg['data_split_mode'])
     global_parameters = model.state_dict()
 
+    round_log = TransparencyLog(cfg['round_log_dir'])
+    client_round_state = {int(u): None for u in range(cfg['num_users'])}
+
     model_history_block2 = {}
     model_history_block2['blocks.2.weight'] = []
     model_history_block2['blocks.2.bias'] = []
@@ -109,7 +150,7 @@ def runExperiment():
     for epoch in range(last_epoch, cfg['num_epochs']['global'] + 1):
         logger.safe(True)
         federation = Federation(epoch, global_parameters, cfg['model_rate'], label_split)
-        train(model_history_block2, model_history_fcnn, dataset['train'], data_split['train'], label_split, federation, model, optimizer, logger, epoch)
+        train(model_history_block2, model_history_fcnn, dataset['train'], data_split['train'], label_split, federation, model, optimizer, logger, epoch, round_log, client_round_state)
         test_model = stats(dataset['train'], model)
         test(dataset['test'], data_split['test'], label_split, test_model, logger, epoch)
         if cfg['scheduler_name'] == 'ReduceLROnPlateau':
@@ -132,10 +173,13 @@ def runExperiment():
     return
 
 
-def train(model_history_block2, model_history_fcnn, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch):
+def train(model_history_block2, model_history_fcnn, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, round_log, client_round_state):
     global_model.load_state_dict(federation.global_parameters)
     global_model.train(True)
-    local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation)
+    user_idx = sample_active_users()
+    round_manifest = federation.build_round_manifest(user_idx)
+    round_checkpoint = round_log.append_round(round_manifest)
+    local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, user_idx, round_log, round_manifest, round_checkpoint, client_round_state)
     num_active_users = len(local)
 
     lr = optimizer.param_groups[0]['lr']
@@ -391,26 +435,99 @@ def test(dataset, data_split, label_split, model, logger, epoch):
     return
 
 
-def make_local(dataset, data_split, label_split, federation):
-    num_active_users = int(np.ceil(cfg['frac'] * cfg['num_users']))
-    user_idx = torch.arange(cfg['num_users'])[torch.randperm(cfg['num_users'])[:num_active_users]].tolist()
+def make_local(dataset, data_split, label_split, federation, user_idx, round_log, round_manifest, round_checkpoint, client_round_state):
+    num_active_users = len(user_idx)
+
+    # This is the committed parent/global model for phase two.
+    # In the prototype, we "send" the full parent model to every active client.
+    parent_parameters = copy.deepcopy(federation.global_parameters)
+
     local_parameters, param_idx = federation.distribute(user_idx)
     local = [None for _ in range(num_active_users)]
 
     for m in range(num_active_users):
-        model_rate_m = federation.model_rate[user_idx[m]]
-        data_loader_m = make_data_loader({'train': SplitDataset(dataset, data_split[user_idx[m]])})['train']
-        local[m] = Local(model_rate_m, data_loader_m, label_split[user_idx[m]])
+        uid = int(user_idx[m])
+        model_rate_m = federation.model_rate[uid]
+        data_loader_m = make_data_loader({'train': SplitDataset(dataset, data_split[uid])})['train']
+
+        # Phase-one metadata validation
+        metadata_valid, metadata_reason = validate_logged_round(
+            user_id=uid,
+            expected_rate=model_rate_m,
+            round_log=round_log,
+            server_manifest=round_manifest,
+            server_checkpoint=round_checkpoint,
+            previous_checkpoint=client_round_state[uid],
+        )
+
+        # Phase-two actual submodel validation
+        if metadata_valid:
+            expected_local_parameters = federation.extract_expected_local_parameters(
+                parent_parameters=parent_parameters,
+                param_idx_for_user=param_idx[m],
+            )
+            submodel_valid, submodel_reason = federation.compare_local_parameters(
+                expected_local_parameters=expected_local_parameters,
+                received_local_parameters=local_parameters[m],
+                atol=0.0,
+                rtol=0.0,
+            )
+        else:
+            submodel_valid, submodel_reason = False, f"metadata invalid: {metadata_reason}"
+
+        trusted_round = metadata_valid and submodel_valid
+        validation_reason = "ok" if trusted_round else (
+            metadata_reason if not metadata_valid else submodel_reason
+        )
+
+        if trusted_round:
+            client_round_state[uid] = round_checkpoint
+
+        local[m] = Local(
+            model_rate=model_rate_m,
+            data_loader=data_loader_m,
+            label_split=label_split[uid],
+            user_id=uid,
+            trusted_round=trusted_round,
+            validation_reason=validation_reason,
+            committed_parent_parameters=parent_parameters,
+            expected_param_idx=param_idx[m],
+        )
+
     return local, local_parameters, user_idx, param_idx
 
 
 class Local:
-    def __init__(self, model_rate, data_loader, label_split):
+    def __init__(self, model_rate, data_loader, label_split, user_id, trusted_round=True, validation_reason="ok", committed_parent_parameters=None, expected_param_idx=None):
         self.model_rate = model_rate
         self.data_loader = data_loader
-        self.label_split = label_split 
+        self.label_split = label_split
+        self.user_id = user_id
+        self.trusted_round = trusted_round
+        self.validation_reason = validation_reason
+        self.committed_parent_parameters = committed_parent_parameters
+        self.expected_param_idx = expected_param_idx
 
     def train(self, local_parameters, lr, logger):
+        if not self.trusted_round:
+            info = {
+                'info': [
+                    f'Client {self.user_id} rejected round before training',
+                    f'Reason: {self.validation_reason}',
+                    f'Validation response: {cfg["validation_response"]}',
+                ]
+            }
+            logger.append(info, 'train', mean=False)
+
+            if cfg['validation_response'] == 'strict_abort':
+                raise RuntimeError(
+                    f'Client {self.user_id} rejected round metadata/submodel: {self.validation_reason}'
+                )
+
+            # zero_change mode: return the received local parameters unchanged,
+            # meaning this client contributes no learning signal beyond what it received.
+            return (copy.deepcopy(local_parameters), [])
+        
         metric = Metric()
         model = eval('models.{}(model_rate=self.model_rate).to(cfg["device"])'.format(cfg['model_name']))
         model.load_state_dict(local_parameters)
