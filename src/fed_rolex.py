@@ -356,6 +356,15 @@ class Federation:
             if exp_t.shape != rec_t.shape:
                 return False, f"shape mismatch on {k}: expected {tuple(exp_t.shape)}, got {tuple(rec_t.shape)}"
 
+            # Harmonize dtype before comparison
+            if exp_t.dtype != rec_t.dtype:
+                if exp_t.is_floating_point() and rec_t.is_floating_point():
+                    common_dtype = torch.float64
+                    exp_t = exp_t.to(common_dtype)
+                    rec_t = rec_t.to(common_dtype)
+                else:
+                    rec_t = rec_t.to(exp_t.dtype)
+
             if not torch.allclose(exp_t, rec_t, atol=atol, rtol=rtol):
                 diff = torch.max(torch.abs(exp_t - rec_t)).item()
                 return False, f"value mismatch on {k}; max_abs_diff={diff}"
