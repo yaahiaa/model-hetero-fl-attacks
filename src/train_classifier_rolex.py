@@ -524,9 +524,14 @@ class Local:
                     f'Client {self.user_id} rejected round metadata/submodel: {self.validation_reason}'
                 )
 
-            # zero_change mode: return the received local parameters unchanged,
-            # meaning this client contributes no learning signal beyond what it received.
-            return (copy.deepcopy(local_parameters), [])
+            # zero_change mode:
+            # return the received local parameters unchanged,
+            # but move them onto the aggregation device so combine() does not crash
+            safe_local_parameters = copy.deepcopy(local_parameters)
+            for k in safe_local_parameters:
+                safe_local_parameters[k] = safe_local_parameters[k].to(cfg['device'])
+
+            return safe_local_parameters, []
         
         metric = Metric()
         model = eval('models.{}(model_rate=self.model_rate).to(cfg["device"])'.format(cfg['model_name']))
