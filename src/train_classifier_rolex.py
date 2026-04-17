@@ -342,6 +342,11 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
         # fig_save_str = "New_Images/reconstructedConvRate_%s"%(count)
         # plt.savefig(fig_save_str)
 
+    # handling when the defense prevents usable reconstructions
+    if len(avg_ssim) == 0 or len(avg_pearson) == 0 or len(avg_psnr) == 0:
+        print("RECONSTRUCT: no valid reconstruction candidates for this round")
+        return 0.0, 0.0, 0
+
     print("RECONSTRUCT: best_ssim across images = %s"%(max(avg_ssim)))
     print("RECONSTRUCT: best_psnr across images = %s"%(max(avg_psnr)))
     print("RECONSTRUCT: best_pearson across images = %s"%(max(avg_pearson)))
