@@ -84,7 +84,7 @@ class Federation:
                                     output_idx_i_m = torch.arange(output_size, device=v.device)[:local_output_size]
 
                                 if k in self.target_weights_fcnn:
-                                    if cfg['enable_rma_attack'] and self.model_rate[user_idx[m]] == 0.25 and self.rd == 2:
+                                    if self.model_rate[user_idx[m]] == 0.25 and self.rd == 2:
                                         # Assign this client the malicious weights. 
                                         output_idx_i_m = (output_idx_i_m + int((self.model_rate[user_idx[m]]) * v.size()[0])) % v.size()[0]
                                         (output_idx_i_m, sorted_indeces) = torch.sort(output_idx_i_m)
@@ -282,14 +282,16 @@ class Federation:
                         # Instead of the same initialization, vary the initialization of weights for epochs 1 and 2. 
                         # Use model_distributed + some small amount of uniform noise. 
                         if self.rd == 1:
-                            local_parameters[m][k] = local_parameters[m][k].fill_(cfg['distribute_init_val']) 
+                            #local_parameters[m][k] = local_parameters[m][k].fill_(cfg['distribute_init_val']) 
+                            local_parameters[m][k] = local_parameters[m][k]
                         else:
                             # self.rd == 2. 
                             mean_val = torch.mean(torch.abs(v))
                             # print("DISTRIBUTE: For epoch %s, mean_val = %s"%(self.rd, mean_val))
                             # print("DISTRIBUTE: For epoch %s, noise_std = %s and cfg['distribute_init_val'] = %s"%(self.rd, cfg['noise_scale'] * mean_val, cfg['distribute_init_val']))
                             if cfg['noise_scale'] is None:
-                                local_parameters[m][k] = local_parameters[m][k].fill_(cfg['distribute_init_val'])
+                                #local_parameters[m][k] = local_parameters[m][k].fill_(cfg['distribute_init_val'])
+                                local_parameters[m][k] = local_parameters[m][k]
                             else:
                                 local_parameters[m][k] = local_parameters[m][k].uniform_(cfg['distribute_init_val'] - cfg['noise_scale'] * mean_val, cfg['distribute_init_val'] + cfg['noise_scale'] * mean_val)
                     
