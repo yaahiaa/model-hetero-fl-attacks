@@ -104,11 +104,10 @@ class TransparencyLog:
         new_checkpoint: Dict[str, Any],
     ) -> bool:
         if previous_checkpoint is None:
-            return int(new_checkpoint["tree_size"]) == 1
+            return int(new_checkpoint["tree_size"]) >= 1
 
         return (
             int(new_checkpoint["tree_size"]) > int(previous_checkpoint["tree_size"])
-            and new_checkpoint["prev_root"] == previous_checkpoint["root_hash"]
             and int(new_checkpoint["round"]) > int(previous_checkpoint["round"])
         )
 

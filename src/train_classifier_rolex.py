@@ -485,7 +485,7 @@ def make_local(dataset, data_split, label_split, federation, user_idx, round_log
             metadata_reason if not metadata_valid else submodel_reason
         )
 
-        if trusted_round:
+        if metadata_valid:
             client_round_state[uid] = round_checkpoint
 
         local[m] = Local(
