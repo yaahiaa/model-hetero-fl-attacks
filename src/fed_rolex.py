@@ -263,7 +263,7 @@ class Federation:
                     else:
                         local_parameters[m][k] = copy.deepcopy(v[param_idx[m][k]])
 
-                    if cfg['enable_rma_attack'] and self.model_rate[user_idx[m]] == 0.25:
+                    if self.model_rate[user_idx[m]] == 0.25:
                         if k == 'layers.0.weight': # Need to do torch cat. 
                             updated_size = (int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])), v.size()[1])
                             self.initialize_weights(updated_size, k)

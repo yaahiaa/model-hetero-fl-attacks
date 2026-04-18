@@ -189,7 +189,7 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
     img_list = None
     for m in range(num_active_users):
         lr = cfg['lr_map'][federation.model_rate[user_idx[m]]] # This line modifies the learning rate based on user. 
-        (local_parameters[m], img_data) = copy.deepcopy(local[m].train(local_parameters[m], lr, logger))
+        (local_parameters[m], img_data, train_report) = copy.deepcopy(local[m].train(local_parameters[m], lr, logger))
         img_list = copy.deepcopy(img_data)
         if m % int((num_active_users * cfg['log_interval']) + 1) == 0:
             local_time = (time.time() - start_time) / (m + 1)
@@ -203,8 +203,38 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
                              'Rate: {}'.format(federation.model_rate[user_idx[m]]),
                              'Epoch Finished Time: {}'.format(epoch_finished_time),
                              'Experiment Finished Time: {}'.format(exp_finished_time)]}
-            logger.append(info, 'train', mean=False)
-            logger.write('train', cfg['metric_name']['train']['Local'])   
+            if m % int((num_active_users * cfg['log_interval']) + 1) == 0:
+                local_time = (time.time() - start_time) / (m + 1)
+                epoch_finished_time = datetime.timedelta(seconds=local_time * (num_active_users - m - 1))
+                exp_finished_time = epoch_finished_time + datetime.timedelta(
+                    seconds=round((cfg['num_epochs']['global'] - epoch) * local_time * num_active_users)
+                )
+
+                info_items = [
+                    'Model: {}'.format(cfg['model_tag']),
+                    'Train Epoch: {}({:.0f}%)'.format(epoch, 100. * m / num_active_users),
+                ]
+
+                if train_report['trained'] and train_report['last_eval'] is not None:
+                    info_items += [
+                        'Local-Loss: {:.4f}'.format(float(train_report['last_eval']['Local-Loss'])),
+                        'Local-Accuracy: {:.4f}'.format(float(train_report['last_eval']['Local-Accuracy'])),
+                    ]
+                else:
+                    info_items += [
+                        'Local-Loss: SKIPPED',
+                        'Local-Accuracy: SKIPPED',
+                    ]
+
+                info_items += [
+                    'ID: {}({}/{})'.format(user_idx[m], m + 1, num_active_users),
+                    'Learning rate: {}'.format(lr),
+                    'Rate: {}'.format(federation.model_rate[user_idx[m]]),
+                    'Epoch Finished Time: {}'.format(epoch_finished_time),
+                    'Experiment Finished Time: {}'.format(exp_finished_time),
+                ]
+
+                print('  '.join(info_items)) 
     
     federation.combine(local_parameters, param_idx, user_idx)
     global_model.load_state_dict(federation.global_parameters)
@@ -536,7 +566,7 @@ class Local:
             for k in safe_local_parameters:
                 safe_local_parameters[k] = safe_local_parameters[k].to(cfg['device'])
 
-            return safe_local_parameters, []
+            return safe_local_parameters, [], {'trained': False,'last_eval': None,'reason': self.validation_reason,}
         
         metric = Metric()
         model = eval('models.{}(model_rate=self.model_rate).to(cfg["device"])'.format(cfg['model_name']))
@@ -545,6 +575,7 @@ class Local:
         optimizer = make_optimizer(model, lr)
         criterion = nn.CrossEntropyLoss()
         input_list = []
+        last_eval = None
 
         for local_epoch in range(1, cfg['num_epochs']['local'] + 1):
             for i, input in list(enumerate(self.data_loader))[:cfg['local_train_size']]:
@@ -560,8 +591,9 @@ class Local:
                 optimizer.step()
                 evaluation = metric.evaluate(cfg['metric_name']['train']['Local'], input, output)
                 logger.append(evaluation, 'train', n=input_size)
+                last_eval = evaluation
         local_parameters = model.state_dict()
-        return (local_parameters, input_list)
+        return (local_parameters, input_list, {'trained': True,'last_eval': last_eval,'reason': 'ok',})
 
 
 if __name__ == "__main__":
