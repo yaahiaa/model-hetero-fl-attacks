@@ -392,7 +392,7 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
     
     federation.combine(local_parameters, param_idx, user_idx)
     #global_model.load_state_dict(federation.global_parameters)
-    #global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
+    
     commitment_event = verify_and_commit_candidate_parent(round_log,epoch,copy.deepcopy(federation.global_parameters),local,
     user_idx,federation,label_split,logger,)
 
@@ -404,7 +404,7 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
         rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
         federation.global_parameters = copy.deepcopy(rollback_state)
         global_model.load_state_dict(rollback_state)
-
+    global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
 
     # Append to the model history. 
     if cfg['model_name'] == 'fcnn':
