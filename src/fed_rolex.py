@@ -251,62 +251,84 @@ class Federation:
         self.make_model_rate()
         param_idx = self.split_model(user_idx)
         local_parameters = [OrderedDict() for _ in range(len(user_idx))]
+
+        attack_round = self.rd in (1, 2)
+
         for k, v in self.global_parameters.items():
             parameter_type = k.split('.')[-1]
+            is_param = ('weight' in parameter_type or 'bias' in parameter_type)
+
             for m in range(len(user_idx)):
-                if 'weight' in parameter_type or 'bias' in parameter_type:
+                # 1) Honest FedRolex extraction (default for all rounds)
+                if is_param:
                     if 'weight' in parameter_type:
                         if v.dim() > 1:
-                            local_parameters[m][k] = copy.deepcopy(v[torch.meshgrid(param_idx[m][k])])
+                            local_parameters[m][k] = copy.deepcopy(
+                                v[torch.meshgrid(param_idx[m][k])]
+                            )
                         else:
-                            local_parameters[m][k] = copy.deepcopy(v[param_idx[m][k]]) # Extracting the sub-parameters for a layer. 
+                            local_parameters[m][k] = copy.deepcopy(
+                                v[param_idx[m][k]]
+                            )
                     else:
-                        local_parameters[m][k] = copy.deepcopy(v[param_idx[m][k]])
-
-                    if self.model_rate[user_idx[m]] == 0.25:
-                        if k == 'layers.0.weight': # Need to do torch cat. 
-                            updated_size = (int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])), v.size()[1])
-                            self.initialize_weights(updated_size, k)
-                        elif k == 'layers.2.weight': # Need to do torch cat along other dimension. 
-                            updated_size = (v.size()[0], int(np.ceil(v.size()[1] * self.model_rate[user_idx[m]])))
-                            self.initialize_weights(updated_size, k)
-                        elif k == 'layers.0.bias': # Need to do torch cat. 
-                            self.initialize_biases(int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])), k)
-                            # local_parameters[m][k] = self.model_to_distribute[k]
-                        elif k == 'layers.2.bias': # No need for torch cat. 
-                            updated_size = v.size()[0]
-                            self.initialize_biases(updated_size, k)
-                        # In any case: 
-                        local_parameters[m][k] = self.model_to_distribute[k]
-                    else:
-                        # Instead of the same initialization, vary the initialization of weights for epochs 1 and 2. 
-                        # Use model_distributed + some small amount of uniform noise. 
-                        if self.rd == 1:
-                            #local_parameters[m][k] = local_parameters[m][k].fill_(cfg['distribute_init_val']) 
-                            local_parameters[m][k] = local_parameters[m][k]
-                        else:
-                            # self.rd == 2. 
-                            mean_val = torch.mean(torch.abs(v))
-                            # print("DISTRIBUTE: For epoch %s, mean_val = %s"%(self.rd, mean_val))
-                            # print("DISTRIBUTE: For epoch %s, noise_std = %s and cfg['distribute_init_val'] = %s"%(self.rd, cfg['noise_scale'] * mean_val, cfg['distribute_init_val']))
-                            if cfg['noise_scale'] is None:
-                                #local_parameters[m][k] = local_parameters[m][k].fill_(cfg['distribute_init_val'])
-                                local_parameters[m][k] = local_parameters[m][k]
-                            else:
-                                local_parameters[m][k] = local_parameters[m][k].uniform_(cfg['distribute_init_val'] - cfg['noise_scale'] * mean_val, cfg['distribute_init_val'] + cfg['noise_scale'] * mean_val)
-                    
-                    # local_parameters[m][k] = local_parameters[m][k].fill_(0.25)
-                    # local_parameters[m][k].uniform_(to=0.0010)
-                    # torch.nn.init.xavier_normal_(local_parameters[m][k], gain=0.5)
-                    # if (k in target_weights or k in target_biases):
-                    # local_parameters[m][k].normal_(mean=1, std=0.0002)
-
+                        local_parameters[m][k] = copy.deepcopy(
+                            v[param_idx[m][k]]
+                        )
                 else:
                     local_parameters[m][k] = copy.deepcopy(v)
+                    continue
 
-                
-        # local_parameters: An array indexed by user_idx, which maps a key (e.g. blocks.weight.0 to its corresponding value (subset of global value))
-        # param_idx: What is returned from split model (i.e. the indeces of which parameters to keep for a given layer). 
+                # ---------------------------------------------------------
+                # 2) Stop here if we are outside the attack window
+                #    => epochs 3+ remain fully honest
+                # ---------------------------------------------------------
+                if not attack_round:
+                    continue
+
+                # ---------------------------------------------------------
+                # 3) Attack behavior only in epochs 1 and 2
+                # ---------------------------------------------------------
+                if self.model_rate[user_idx[m]] == 0.25:
+                    # Target cohort: replace honest slice with malicious slice
+                    if k == 'layers.0.weight':
+                        updated_size = (
+                            int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])),
+                            v.size()[1]
+                        )
+                        self.initialize_weights(updated_size, k)
+
+                    elif k == 'layers.2.weight':
+                        updated_size = (
+                            v.size()[0],
+                            int(np.ceil(v.size()[1] * self.model_rate[user_idx[m]]))
+                        )
+                        self.initialize_weights(updated_size, k)
+
+                    elif k == 'layers.0.bias':
+                        updated_size = int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]]))
+                        self.initialize_biases(updated_size, k)
+
+                    elif k == 'layers.2.bias':
+                        updated_size = v.size()[0]
+                        self.initialize_biases(updated_size, k)
+
+                    local_parameters[m][k] = self.model_to_distribute[k]
+
+                else:
+                    # Non-target cohorts: attack behavior only for epochs 1 and 2
+                    if self.rd == 1:
+                        # Original attack-style pinned distribution
+                        local_parameters[m][k] = local_parameters[m][k].fill_(cfg['distribute_init_val'])
+
+                    elif self.rd == 2:
+                        mean_val = torch.mean(torch.abs(v))
+                        if cfg['noise_scale'] is None:
+                            local_parameters[m][k] = local_parameters[m][k].fill_(cfg['distribute_init_val'])
+                        else:
+                            low = cfg['distribute_init_val'] - cfg['noise_scale'] * mean_val
+                            high = cfg['distribute_init_val'] + cfg['noise_scale'] * mean_val
+                            local_parameters[m][k] = local_parameters[m][k].uniform_(low, high)
+
         return local_parameters, param_idx
     
 
