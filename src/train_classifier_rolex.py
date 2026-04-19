@@ -62,11 +62,19 @@ def compare_local_parameters(received, expected, atol=1e-6, rtol=1e-4):
     for k in expected:
         if k not in received:
             return False, f'missing key: {k}'
-        if received[k].shape != expected[k].shape:
-            return False, f'shape mismatch for {k}: got={tuple(received[k].shape)} expected={tuple(expected[k].shape)}'
-        if not torch.allclose(received[k].to(expected[k].device), expected[k], atol=atol, rtol=rtol):
-            max_diff = torch.max(torch.abs(received[k].to(expected[k].device) - expected[k])).item()
+
+        recv = received[k]
+        exp = expected[k]
+
+        if recv.shape != exp.shape:
+            return False, f'shape mismatch for {k}: got={tuple(recv.shape)} expected={tuple(exp.shape)}'
+
+        recv = recv.to(device=exp.device, dtype=exp.dtype)
+
+        if not torch.allclose(recv, exp, atol=atol, rtol=rtol):
+            max_diff = torch.max(torch.abs(recv - exp)).item()
             return False, f'value mismatch for {k}: max_diff={max_diff:.6e}'
+
     return True, 'ok'
 
 
@@ -610,12 +618,26 @@ def test(dataset, data_split, label_split, model, logger, epoch):
     return
 
 
+def cast_local_parameters_to_reference(local_parameters, expected_local_parameters):
+    fixed = [OrderedDict() for _ in range(len(local_parameters))]
+    for m in range(len(local_parameters)):
+        for k in local_parameters[m]:
+            if k in expected_local_parameters[m]:
+                fixed[m][k] = local_parameters[m][k].to(
+                    device=expected_local_parameters[m][k].device,
+                    dtype=expected_local_parameters[m][k].dtype
+                )
+            else:
+                fixed[m][k] = local_parameters[m][k]
+    return fixed
+
 def make_local(dataset, data_split, label_split, federation, round_log):
     num_active_users = int(np.ceil(cfg['frac'] * cfg['num_users']))
     user_idx = torch.arange(cfg['num_users'])[torch.randperm(cfg['num_users'])[:num_active_users]].tolist()
 
     local_parameters, param_idx = federation.distribute(user_idx)
     expected_local_parameters = extract_expected_local_parameters(federation, user_idx, param_idx)
+    local_parameters = cast_local_parameters_to_reference(local_parameters, expected_local_parameters)
 
     local = [None for _ in range(num_active_users)]
 
