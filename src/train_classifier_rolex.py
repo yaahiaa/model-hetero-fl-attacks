@@ -435,7 +435,10 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
                             if (weight_grad is not None and bias_grad is not None):
                                 bias_grad_sum = torch.abs(torch.sum(bias_grad)).item()
                                 if bias_grad_sum != 0.0:
-                                    (max_pearson, max_psnr, num_recovered) = reconstruct_image(weight_grad, bias_grad, img_list)
+                                    if img_list is not None and len(img_list) > 0:
+                                        (max_pearson, max_psnr, num_recovered) = reconstruct_image(weight_grad, bias_grad, img_list)
+                                    else:
+                                        print("RECONSTRUCT: skipped because no local image batch was recorded this round")
                                     max_pearson_overall = max(max_pearson_overall, max_pearson)
                                     max_psnr_overall = max(max_psnr_overall, max_psnr)
                                     max_pearson_list.append(max_pearson)
