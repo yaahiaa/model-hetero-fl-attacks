@@ -437,13 +437,13 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
                                 if bias_grad_sum != 0.0:
                                     if img_list is not None and len(img_list) > 0:
                                         (max_pearson, max_psnr, num_recovered) = reconstruct_image(weight_grad, bias_grad, img_list)
+                                        max_pearson_overall = max(max_pearson_overall, max_pearson)
+                                        max_psnr_overall = max(max_psnr_overall, max_psnr)
+                                        max_pearson_list.append(max_pearson)
+                                        max_psnr_list.append(max_psnr)
+                                        num_recovered_list.append(num_recovered)
                                     else:
                                         print("RECONSTRUCT: skipped because no local image batch was recorded this round")
-                                    max_pearson_overall = max(max_pearson_overall, max_pearson)
-                                    max_psnr_overall = max(max_psnr_overall, max_psnr)
-                                    max_pearson_list.append(max_pearson)
-                                    max_psnr_list.append(max_psnr)
-                                    num_recovered_list.append(num_recovered)
             if len(max_pearson_list) > 0:
                 N_Table = cfg['local_train_size']
                 Max_Pearson_Table = max(max_pearson_list)
