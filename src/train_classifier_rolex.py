@@ -257,6 +257,14 @@ def main():
         runExperiment()
     return
 
+def move_state_dict_to_device(state_dict, device):
+    moved = OrderedDict()
+    for k, v in state_dict.items():
+        if torch.is_tensor(v):
+            moved[k] = v.to(device)
+        else:
+            moved[k] = v
+    return moved
 
 def runExperiment():
     seed = int(cfg['model_tag'].split('_')[0])
@@ -312,6 +320,7 @@ def runExperiment():
 
         approved_parent_record = round_log.get_latest_approved_parent()
         approved_parent_state = round_log.load_parent_state_dict(approved_parent_record)
+        approved_parent_state = move_state_dict_to_device(approved_parent_state, cfg['device'])
         global_parameters = copy.deepcopy(approved_parent_state)
 
         federation = Federation(epoch, global_parameters, cfg['model_rate'], label_split)
@@ -392,6 +401,7 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
     else:
         approved_parent_record = round_log.get_latest_approved_parent()
         rollback_state = round_log.load_parent_state_dict(approved_parent_record)
+        rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
         federation.global_parameters = copy.deepcopy(rollback_state)
         global_model.load_state_dict(rollback_state)
 
