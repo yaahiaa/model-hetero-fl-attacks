@@ -6,6 +6,7 @@ import numpy as np
 import os
 import shutil
 import time
+import round_log
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -21,6 +22,7 @@ import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from torchvision import transforms
+from round_log import TransparencyLog
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 cudnn.benchmark = True
@@ -43,10 +45,198 @@ cfg['local_train_size'] = 10
 cfg['noise_scale'] = None
 cfg['distribute_init_val'] = 0.25
 cfg['file_output'] = "New_Tables/MNIST_Rolex_TEST"
+# -------------------------------------------------------------------------
+# Prototype-2 defense configuration
+# -------------------------------------------------------------------------
+cfg.setdefault('validation_response', 'zero_change')
+cfg.setdefault('round_log_dir', os.path.join('output', 'round_log', 'prototype2'))
+cfg.setdefault('verifier_val_size', 2)
+cfg.setdefault('verifier_max_loss_increase', 0.35)
+cfg.setdefault('verifier_max_acc_drop', 0.20)
+cfg.setdefault('verifier_min_relative_change', 1.0e-6)
 full_path = os.getcwd() + "/" + cfg['file_output']
 fp = open(full_path, 'w')
 fp.write("N Max_Pearson Max_PSNR Max_Recovered\n")
 
+def compare_local_parameters(received, expected, atol=1e-6, rtol=1e-4):
+    for k in expected:
+        if k not in received:
+            return False, f'missing key: {k}'
+        if received[k].shape != expected[k].shape:
+            return False, f'shape mismatch for {k}: got={tuple(received[k].shape)} expected={tuple(expected[k].shape)}'
+        if not torch.allclose(received[k].to(expected[k].device), expected[k], atol=atol, rtol=rtol):
+            max_diff = torch.max(torch.abs(received[k].to(expected[k].device) - expected[k])).item()
+            return False, f'value mismatch for {k}: max_diff={max_diff:.6e}'
+    return True, 'ok'
+
+
+def extract_expected_local_parameters(federation, user_idx, param_idx):
+    expected_local_parameters, _ = federation.extract_honest_local_parameters(
+        user_idx, param_idx=param_idx
+    )
+    return expected_local_parameters
+
+
+def evaluate_local_parameters(local_parameters, model_rate, data_loader, label_split, max_steps=None):
+    metric = Metric()
+    model = eval('models.{}(model_rate=model_rate).to(cfg["device"])'.format(cfg['model_name']))
+    model.load_state_dict(local_parameters)
+    model.train(False)
+
+    total_loss = 0.0
+    total_acc = 0.0
+    total_seen = 0
+
+    with torch.no_grad():
+        for i, input in enumerate(data_loader):
+            if max_steps is not None and i >= max_steps:
+                break
+
+            input = collate(input)
+            input_size = input['img'].size(0)
+            input['label_split'] = torch.tensor(label_split)
+            input = to_device(input, cfg['device'])
+
+            output = model(input)
+            evaluation = metric.evaluate(cfg['metric_name']['train']['Local'], input, output)
+
+            total_loss += float(evaluation['Local-Loss']) * input_size
+            total_acc += float(evaluation['Local-Accuracy']) * input_size
+            total_seen += input_size
+
+    if total_seen == 0:
+        return {'Local-Loss': float('inf'), 'Local-Accuracy': 0.0}
+
+    return {
+        'Local-Loss': total_loss / total_seen,
+        'Local-Accuracy': total_acc / total_seen,
+    }
+
+
+def relative_model_change(prev_local_parameters, cand_local_parameters):
+    prev_vec = []
+    cand_vec = []
+
+    for k in prev_local_parameters:
+        prev_vec.append(prev_local_parameters[k].detach().float().reshape(-1).cpu())
+        cand_vec.append(cand_local_parameters[k].detach().float().reshape(-1).cpu())
+
+    prev_vec = torch.cat(prev_vec)
+    cand_vec = torch.cat(cand_vec)
+
+    denom = torch.norm(prev_vec, p=2).item() + 1.0e-12
+    return float(torch.norm(cand_vec - prev_vec, p=2).item() / denom)
+
+
+def select_verifiers(local, user_idx, federation):
+    """
+    Pick at least one verifier per cohort from the active clients of this round.
+    """
+    selected = OrderedDict()
+    for m in range(len(user_idx)):
+        rate = float(federation.model_rate[user_idx[m]])
+        if rate not in selected:
+            selected[rate] = (m, int(user_idx[m]), local[m])
+    return list(selected.values())
+
+
+def verify_and_commit_candidate_parent(round_log, epoch, candidate_state_dict, local, user_idx, federation, label_split, logger):
+    """
+    Prototype-2 verifier rule:
+    - one verifier per cohort
+    - compare candidate parent vs previous approved parent
+    - use small private validation and relative model change
+    - write approval / rejection into the non-server-controlled log
+    """
+    previous_parent_record = round_log.get_latest_approved_parent()
+    previous_parent_state = round_log.load_parent_state_dict(previous_parent_record)
+
+    verifier_reports = []
+
+    for _, verifier_user_id, verifier_local in select_verifiers(local, user_idx, federation):
+        prev_federation = Federation(
+            epoch + 1,
+            copy.deepcopy(previous_parent_state),
+            cfg['model_rate'],
+            label_split
+        )
+        cand_federation = Federation(
+            epoch + 1,
+            copy.deepcopy(candidate_state_dict),
+            cfg['model_rate'],
+            label_split
+        )
+
+        prev_local_parameters, _ = prev_federation.extract_honest_local_parameters([verifier_user_id])
+        cand_local_parameters, _ = cand_federation.extract_honest_local_parameters([verifier_user_id])
+
+        prev_local_parameters = prev_local_parameters[0]
+        cand_local_parameters = cand_local_parameters[0]
+
+        prev_eval = evaluate_local_parameters(
+            prev_local_parameters,
+            prev_federation.model_rate[verifier_user_id],
+            verifier_local.data_loader,
+            verifier_local.label_split,
+            max_steps=cfg['verifier_val_size'],
+        )
+
+        cand_eval = evaluate_local_parameters(
+            cand_local_parameters,
+            cand_federation.model_rate[verifier_user_id],
+            verifier_local.data_loader,
+            verifier_local.label_split,
+            max_steps=cfg['verifier_val_size'],
+        )
+
+        rel_change = relative_model_change(prev_local_parameters, cand_local_parameters)
+        cohort_rate = float(cand_federation.model_rate[verifier_user_id])
+
+        approved = True
+        reason = 'ok'
+
+        if cand_eval['Local-Loss'] > prev_eval['Local-Loss'] + cfg['verifier_max_loss_increase']:
+            approved = False
+            reason = 'validation loss increased too much'
+        elif cand_eval['Local-Accuracy'] + cfg['verifier_max_acc_drop'] < prev_eval['Local-Accuracy']:
+            approved = False
+            reason = 'validation accuracy dropped too much'
+        elif rel_change < cfg['verifier_min_relative_change']:
+            approved = False
+            reason = 'candidate too similar to previous approved parent'
+
+        verifier_reports.append({
+            'user_id': int(verifier_user_id),
+            'cohort_rate': cohort_rate,
+            'approved': approved,
+            'reason': reason,
+            'prev_eval': prev_eval,
+            'cand_eval': cand_eval,
+            'relative_change': rel_change,
+        })
+
+    active_user_model_rates = {
+        int(uid): float(federation.model_rate[uid]) for uid in user_idx
+    }
+
+    event = round_log.record_candidate_parent(
+        epoch=epoch,
+        state_dict=copy.deepcopy(candidate_state_dict),
+        active_users=user_idx,
+        active_user_model_rates=active_user_model_rates,
+        verifier_reports=verifier_reports,
+    )
+
+    logger.append({
+        'info': [
+            f'Prototype-2 commitment check for round {epoch + 1}',
+            f'commitment approved: {event["approved"]}',
+            f'approved cohorts: {event["approved_cohort_rates"]}',
+            f'required cohorts: {event["required_cohort_rates"]}',
+        ]
+    }, 'train', mean=False)
+
+    return event
 
 def main():
     process_control()
@@ -90,6 +280,9 @@ def runExperiment():
         data_split, label_split = split_dataset(dataset, cfg['num_users'], cfg['data_split_mode'])
     global_parameters = model.state_dict()
 
+    round_log = TransparencyLog(cfg['round_log_dir'])
+    round_log.bootstrap_initial_parent(global_parameters, parent_for_round=1)
+
     model_history_block2 = {}
     model_history_block2['blocks.2.weight'] = []
     model_history_block2['blocks.2.bias'] = []
@@ -108,8 +301,25 @@ def runExperiment():
 
     for epoch in range(last_epoch, cfg['num_epochs']['global'] + 1):
         logger.safe(True)
+
+        approved_parent_record = round_log.get_latest_approved_parent()
+        approved_parent_state = round_log.load_parent_state_dict(approved_parent_record)
+        global_parameters = copy.deepcopy(approved_parent_state)
+
         federation = Federation(epoch, global_parameters, cfg['model_rate'], label_split)
-        train(model_history_block2, model_history_fcnn, dataset['train'], data_split['train'], label_split, federation, model, optimizer, logger, epoch)
+        train(
+            model_history_block2,
+            model_history_fcnn,
+            dataset['train'],
+            data_split['train'],
+            label_split,
+            federation,
+            model,
+            optimizer,
+            logger,
+            epoch,
+            round_log
+        )
         test_model = stats(dataset['train'], model)
         test(dataset['test'], data_split['test'], label_split, test_model, logger, epoch)
         if cfg['scheduler_name'] == 'ReduceLROnPlateau':
@@ -132,10 +342,10 @@ def runExperiment():
     return
 
 
-def train(model_history_block2, model_history_fcnn, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch):
+def train(model_history_block2, model_history_fcnn, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, round_log):
     global_model.load_state_dict(federation.global_parameters)
     global_model.train(True)
-    local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation)
+    local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, round_log)
     num_active_users = len(local)
 
     lr = optimizer.param_groups[0]['lr']
@@ -146,7 +356,8 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
     for m in range(num_active_users):
         lr = cfg['lr_map'][federation.model_rate[user_idx[m]]] # This line modifies the learning rate based on user. 
         (local_parameters[m], img_data) = copy.deepcopy(local[m].train(local_parameters[m], lr, logger))
-        img_list = copy.deepcopy(img_data)
+        if img_data:
+            img_list = copy.deepcopy(img_data)
         if m % int((num_active_users * cfg['log_interval']) + 1) == 0:
             local_time = (time.time() - start_time) / (m + 1)
             epoch_finished_time = datetime.timedelta(seconds=local_time * (num_active_users - m - 1))
@@ -163,10 +374,18 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
             logger.write('train', cfg['metric_name']['train']['Local'])   
     
     federation.combine(local_parameters, param_idx, user_idx)
-    global_model.load_state_dict(federation.global_parameters)
+    #global_model.load_state_dict(federation.global_parameters)
+    #global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
+    commitment_event = verify_and_commit_candidate_parent(round_log,epoch,copy.deepcopy(federation.global_parameters),local,
+    user_idx,federation,label_split,logger,)
 
-
-    global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
+    if commitment_event['approved']:
+        global_model.load_state_dict(federation.global_parameters)
+    else:
+        approved_parent_record = round_log.get_latest_approved_parent()
+        rollback_state = round_log.load_parent_state_dict(approved_parent_record)
+        federation.global_parameters = copy.deepcopy(rollback_state)
+        global_model.load_state_dict(rollback_state)
 
 
     # Append to the model history. 
@@ -391,26 +610,67 @@ def test(dataset, data_split, label_split, model, logger, epoch):
     return
 
 
-def make_local(dataset, data_split, label_split, federation):
+def make_local(dataset, data_split, label_split, federation, round_log):
     num_active_users = int(np.ceil(cfg['frac'] * cfg['num_users']))
     user_idx = torch.arange(cfg['num_users'])[torch.randperm(cfg['num_users'])[:num_active_users]].tolist()
+
     local_parameters, param_idx = federation.distribute(user_idx)
+    expected_local_parameters = extract_expected_local_parameters(federation, user_idx, param_idx)
+
     local = [None for _ in range(num_active_users)]
 
     for m in range(num_active_users):
         model_rate_m = federation.model_rate[user_idx[m]]
-        data_loader_m = make_data_loader({'train': SplitDataset(dataset, data_split[user_idx[m]])})['train']
-        local[m] = Local(model_rate_m, data_loader_m, label_split[user_idx[m]])
+        data_loader_m = make_data_loader({
+            'train': SplitDataset(dataset, data_split[user_idx[m]])
+        })['train']
+
+        local[m] = Local(
+            user_idx[m],
+            model_rate_m,
+            data_loader_m,
+            label_split[user_idx[m]],
+            expected_local_parameters[m]
+        )
+
+        local[m].trusted_round, local[m].validation_reason = compare_local_parameters(
+            local_parameters[m],
+            expected_local_parameters[m]
+        )
+
     return local, local_parameters, user_idx, param_idx
 
 
 class Local:
-    def __init__(self, model_rate, data_loader, label_split):
+    def __init__(self, user_id, model_rate, data_loader, label_split, expected_local_parameters):
+        self.user_id = user_id
         self.model_rate = model_rate
         self.data_loader = data_loader
-        self.label_split = label_split 
+        self.label_split = label_split
+        self.expected_local_parameters = expected_local_parameters
+        self.trusted_round = True
+        self.validation_reason = 'ok' 
 
     def train(self, local_parameters, lr, logger):
+        if not self.trusted_round:
+            logger.append({
+                'info': [
+                    f'Client {self.user_id} rejected malicious submodel before training',
+                    f'Reason: {self.validation_reason}',
+                    f'Validation response: {cfg["validation_response"]}',
+                ]
+            }, 'train', mean=False)
+
+            if cfg['validation_response'] == 'strict_abort':
+                raise RuntimeError(
+                    f'Client {self.user_id} rejected round metadata/submodel: {self.validation_reason}'
+                )
+
+            safe_local_parameters = copy.deepcopy(self.expected_local_parameters)
+            for k in safe_local_parameters:
+                safe_local_parameters[k] = safe_local_parameters[k].to(cfg['device'])
+
+            return safe_local_parameters, []
         metric = Metric()
         model = eval('models.{}(model_rate=self.model_rate).to(cfg["device"])'.format(cfg['model_name']))
         model.load_state_dict(local_parameters)
