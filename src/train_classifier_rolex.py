@@ -543,6 +543,45 @@ class Local:
         self.committed_parent_parameters = committed_parent_parameters
         self.expected_param_idx = expected_param_idx
 
+    def _extract_expected_local_parameters(self):
+        """
+        Rebuild the honest local submodel from the committed parent/global model
+        and the expected parameter indices for this client.
+        """
+        if self.committed_parent_parameters is None or self.expected_param_idx is None:
+            raise RuntimeError(
+                f"Client {self.user_id} cannot reconstruct honest fallback: "
+                "missing committed_parent_parameters or expected_param_idx"
+            )
+
+        expected_local_parameters = OrderedDict()
+
+        for k, v in self.committed_parent_parameters.items():
+            parameter_type = k.split('.')[-1]
+
+            if 'weight' in parameter_type or 'bias' in parameter_type:
+                if 'weight' in parameter_type:
+                    if v.dim() > 1:
+                        # expected_param_idx[k] is typically a tuple/list of index tensors
+                        expected_local_parameters[k] = copy.deepcopy(
+                            v[torch.meshgrid(*self.expected_param_idx[k], indexing='ij')]
+                        )
+                    else:
+                        expected_local_parameters[k] = copy.deepcopy(
+                            v[self.expected_param_idx[k]]
+                        )
+                else:
+                    expected_local_parameters[k] = copy.deepcopy(
+                        v[self.expected_param_idx[k]]
+                    )
+            else:
+                expected_local_parameters[k] = copy.deepcopy(v)
+
+            expected_local_parameters[k] = expected_local_parameters[k].to(cfg['device'])
+
+        return expected_local_parameters
+
+
     def train(self, local_parameters, lr, logger):
         if not self.trusted_round:
             info = {
@@ -559,41 +598,76 @@ class Local:
                     f'Client {self.user_id} rejected round metadata/submodel: {self.validation_reason}'
                 )
 
-            # zero_change mode:
-            # return the received local parameters unchanged,
-            # but move them onto the aggregation device so combine() does not crash
-            safe_local_parameters = copy.deepcopy(local_parameters)
-            for k in safe_local_parameters:
-                safe_local_parameters[k] = safe_local_parameters[k].to(cfg['device'])
+            # Fallback mode:
+            # reconstruct and return the honest expected local extraction
+            # so aggregation stays aligned with the committed parent model.
+            fallback_local_parameters = self._extract_expected_local_parameters()
 
-            return safe_local_parameters, [], {'trained': False,'last_eval': None,'reason': self.validation_reason,}
-        
+            return (
+                fallback_local_parameters,
+                [],
+                {
+                    'trained': False,
+                    'last_eval': None,
+                    'reason': self.validation_reason,
+                    'used_fallback': True,
+                }
+            )
+
         metric = Metric()
         model = eval('models.{}(model_rate=self.model_rate).to(cfg["device"])'.format(cfg['model_name']))
         model.load_state_dict(local_parameters)
         model.train(True)
+
         optimizer = make_optimizer(model, lr)
         criterion = nn.CrossEntropyLoss()
         input_list = []
-        last_eval = None
+
+        # Running averages across all local steps
+        total_loss = 0.0
+        total_acc = 0.0
+        total_seen = 0
 
         for local_epoch in range(1, cfg['num_epochs']['local'] + 1):
             for i, input in list(enumerate(self.data_loader))[:cfg['local_train_size']]:
                 input_list.append(input['img'])
                 input = collate(input)
                 input_size = input['img'].size(0)
+
                 input['label_split'] = torch.tensor(self.label_split)
                 input = to_device(input, cfg['device'])
+
                 optimizer.zero_grad()
                 output = model(input)
                 output['loss'].backward()
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
                 optimizer.step()
+
                 evaluation = metric.evaluate(cfg['metric_name']['train']['Local'], input, output)
                 logger.append(evaluation, 'train', n=input_size)
-                last_eval = evaluation
+
+                total_loss += float(evaluation['Local-Loss']) * input_size
+                total_acc += float(evaluation['Local-Accuracy']) * input_size
+                total_seen += input_size
+
         local_parameters = model.state_dict()
-        return (local_parameters, input_list, {'trained': True,'last_eval': last_eval,'reason': 'ok',})
+
+        avg_eval = None
+        if total_seen > 0:
+            avg_eval = {
+                'Local-Loss': total_loss / total_seen,
+                'Local-Accuracy': total_acc / total_seen,
+            }
+
+        return (
+            local_parameters,
+            input_list,
+            {
+                'trained': True,
+                'last_eval': avg_eval,   # now this is an average, not the final minibatch
+                'reason': 'ok',
+                'used_fallback': False,
+            }
+        )
 
 
 if __name__ == "__main__":
