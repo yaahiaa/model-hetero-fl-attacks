@@ -17,6 +17,7 @@ class Federation:
     def __init__(self, epoch, global_parameters, rate, label_split):
         self.rd = epoch
         self.global_parameters = global_parameters
+        self.initial_parent_state = _clone_state_dict(global_parameters)
         self.target_weights = ['blocks.2.weight']
         self.target_weights_fcnn = ['layers.0.weight']
         self.target_biases = ['blocks.0.bias', 'blocks.2.bias']
@@ -44,6 +45,7 @@ class Federation:
             idx = [OrderedDict() for _ in range(len(user_idx))]
             output_weight_name = [k for k in self.global_parameters.keys() if 'weight' in k][-1]
             output_bias_name = [k for k in self.global_parameters.keys() if 'bias' in k][-1]
+            replay_round = int(cfg.get('attack_replay_round', 4))
 
             for k, v in self.global_parameters.items():
                 parameter_type = k.split('.')[-1]
