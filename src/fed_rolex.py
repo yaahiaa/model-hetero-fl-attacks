@@ -4,7 +4,14 @@ import numpy as np
 from config import cfg
 from collections import OrderedDict
 
-
+def _clone_state_dict(state_dict):
+    cloned = OrderedDict()
+    for k, v in state_dict.items():
+        if torch.is_tensor(v):
+            cloned[k] = v.detach().clone()
+        else:
+            cloned[k] = copy.deepcopy(v)
+    return cloned
 
 class Federation:
     def __init__(self, epoch, global_parameters, rate, label_split):
@@ -17,7 +24,7 @@ class Federation:
         self.rate = rate
         self.label_split = label_split
         self.model_to_distribute = OrderedDict()
-
+        self.last_distribution_debug = []
         self.make_model_rate()
 
     def make_model_rate(self):
@@ -59,7 +66,7 @@ class Federation:
                                     output_idx_i_m = torch.arange(output_size, device=v.device)[:local_output_size]
 
                                 if k in self.target_weights_fcnn:
-                                    if self.model_rate[user_idx[m]] == 0.25 and self.rd == 2:
+                                    if self.model_rate[user_idx[m]] == 0.25 and self.rd == replay_round:
                                         # Assign this client the malicious weights. 
                                         output_idx_i_m = (output_idx_i_m + int((self.model_rate[user_idx[m]]) * v.size()[0])) % v.size()[0]
                                         (output_idx_i_m, sorted_indeces) = torch.sort(output_idx_i_m)
@@ -255,64 +262,23 @@ class Federation:
 
 
     def distribute(self, user_idx):
-        # First build the honest FedRolex extraction.
+        # attack now happens in the commitment phase,
+        # not here. Distribution is always from the committed parent.
         local_parameters, param_idx = self.extract_honest_local_parameters(user_idx)
 
-        # Keep the original RMA behavior only for rounds 1 and 2.
-        # After that, revert to honest FedRolex distribution.
-        attack_round = self.rd in (1, 2)
-        if not attack_round:
-            return local_parameters, param_idx
-
-        for k, v in self.global_parameters.items():
-            parameter_type = k.split('.')[-1]
-
-            for m in range(len(user_idx)):
-                if 'weight' not in parameter_type and 'bias' not in parameter_type:
-                    continue
-
-                # Target cohort: malicious distribution in rounds 1 and 2 only
-                if self.model_rate[user_idx[m]] == 0.25:
-                    if k == 'layers.0.weight':
-                        updated_size = (
-                            int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])),
-                            v.size()[1]
-                        )
-                        self.initialize_weights(updated_size, k)
-
-                    elif k == 'layers.2.weight':
-                        updated_size = (
-                            v.size()[0],
-                            int(np.ceil(v.size()[1] * self.model_rate[user_idx[m]]))
-                        )
-                        self.initialize_weights(updated_size, k)
-
-                    elif k == 'layers.0.bias':
-                        updated_size = int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]]))
-                        self.initialize_biases(updated_size, k)
-
-                    elif k == 'layers.2.bias':
-                        updated_size = v.size()[0]
-                        self.initialize_biases(updated_size, k)
-
-                    local_parameters[m][k] = self.model_to_distribute[k]
-
-                # Non-target cohorts: fake constant / noisy distribution in rounds 1 and 2 only
-                else:
-                    if self.rd == 1:
-                        local_parameters[m][k] = local_parameters[m][k].fill_(
-                            cfg['distribute_init_val']
-                        )
-                    else:
-                        mean_val = torch.mean(torch.abs(v))
-                        if cfg['noise_scale'] is None:
-                            local_parameters[m][k] = local_parameters[m][k].fill_(
-                                cfg['distribute_init_val']
-                            )
-                        else:
-                            low = cfg['distribute_init_val'] - cfg['noise_scale'] * mean_val
-                            high = cfg['distribute_init_val'] + cfg['noise_scale'] * mean_val
-                            local_parameters[m][k] = local_parameters[m][k].uniform_(low, high)
+        self.last_distribution_debug = []
+        replay_round = int(cfg.get('attack_replay_round', 4))
+        for m, uid in enumerate(user_idx):
+            self.last_distribution_debug.append({
+                'round': int(self.rd),
+                'user_id': int(uid),
+                'model_rate': float(self.model_rate[uid]),
+                'target_shift_applied': bool(
+                    cfg['model_name'] == 'fcnn'
+                    and float(self.model_rate[uid]) == 0.25
+                    and int(self.rd) == replay_round
+                ),
+            })
 
         return local_parameters, param_idx
 

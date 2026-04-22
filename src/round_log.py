@@ -98,7 +98,17 @@ class TransparencyLog:
         self._write_latest(event)
         return event
 
-    def record_candidate_parent(self, *, epoch, state_dict, active_users, active_user_model_rates, verifier_reports):
+
+    def record_candidate_parent(
+        self,
+        *,
+        epoch,
+        state_dict,
+        active_users,
+        active_user_model_rates,
+        verifier_reports,
+        candidate_metadata=None,
+    ):
         model_hash = hash_state_dict(state_dict)
         snapshot_file = f'parent_round_{int(epoch) + 1}_{model_hash}.pt'
         torch.save(copy.deepcopy(state_dict), self.snapshots_dir / snapshot_file)
@@ -121,9 +131,14 @@ class TransparencyLog:
             'approved': quorum_ok,
             'timestamp': int(time.time()),
         }
+
+        if candidate_metadata is not None:
+            event['candidate_metadata'] = candidate_metadata
+
         event['commitment_id'] = hashlib.sha256(
             json.dumps(event, sort_keys=True).encode('utf-8')
         ).hexdigest()
+
         self._append_event(event)
 
         if quorum_ok:
@@ -132,4 +147,5 @@ class TransparencyLog:
             self._append_event(approved_event)
             self._write_latest(approved_event)
             return approved_event
+
         return event

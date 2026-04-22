@@ -1,6 +1,7 @@
 import argparse
 import copy
 import datetime
+import hashlib
 import models
 import numpy as np
 import os
@@ -135,6 +136,175 @@ def relative_model_change(prev_local_parameters, cand_local_parameters):
     denom = torch.norm(prev_vec, p=2).item() + 1.0e-12
     return float(torch.norm(cand_vec - prev_vec, p=2).item() / denom)
 
+def clone_state_dict(state_dict):
+    cloned = OrderedDict()
+    for k, v in state_dict.items():
+        if torch.is_tensor(v):
+            cloned[k] = v.detach().clone()
+        else:
+            cloned[k] = copy.deepcopy(v)
+    return cloned
+
+
+def hash_local_parameter_dict(local_parameters):
+    hasher = hashlib.sha256()
+    for key in sorted(local_parameters.keys()):
+        tensor = local_parameters[key].detach().cpu().contiguous()
+        hasher.update(key.encode('utf-8'))
+        hasher.update(str(tuple(tensor.shape)).encode('utf-8'))
+        hasher.update(str(tensor.dtype).encode('utf-8'))
+        hasher.update(tensor.numpy().tobytes())
+    return hasher.hexdigest()
+
+
+def state_dict_relative_l2(a_state, b_state):
+    a_vec = []
+    b_vec = []
+    for k in a_state:
+        if torch.is_tensor(a_state[k]) and torch.is_tensor(b_state[k]):
+            a_vec.append(a_state[k].detach().float().reshape(-1).cpu())
+            b_vec.append(b_state[k].detach().float().reshape(-1).cpu())
+    if not a_vec:
+        return 0.0
+    a_vec = torch.cat(a_vec)
+    b_vec = torch.cat(b_vec)
+    denom = torch.norm(a_vec, p=2).item() + 1.0e-12
+    return float(torch.norm(b_vec - a_vec, p=2).item() / denom)
+
+
+def add_uniform_noise_to_state_dict(state_dict, noise_scale):
+    noisy = clone_state_dict(state_dict)
+
+    if noise_scale is None or float(noise_scale) <= 0.0:
+        return noisy, {
+            'noise_enabled': False,
+            'noise_scale': float(noise_scale or 0.0),
+            'noise_rel_l2': 0.0,
+            'noise_max_abs': 0.0,
+            'noise_mean_abs': 0.0,
+        }
+
+    total_noise_sq = 0.0
+    total_base_sq = 0.0
+    max_abs = 0.0
+    total_abs = 0.0
+    total_count = 0
+
+    for k, v in noisy.items():
+        if not torch.is_tensor(v) or not torch.is_floating_point(v):
+            continue
+
+        mean_abs = torch.mean(torch.abs(v)).item()
+        if not np.isfinite(mean_abs) or mean_abs == 0.0:
+            continue
+
+        delta = float(noise_scale) * mean_abs
+        noise = torch.empty_like(v).uniform_(-delta, delta)
+        noisy[k] = v + noise
+
+        total_noise_sq += float(torch.sum(noise.float() ** 2).item())
+        total_base_sq += float(torch.sum(v.float() ** 2).item())
+
+        abs_noise = torch.abs(noise).detach().float()
+        max_abs = max(max_abs, float(torch.max(abs_noise).item()))
+        total_abs += float(torch.sum(abs_noise).item())
+        total_count += int(abs_noise.numel())
+
+    rel_l2 = float(np.sqrt(total_noise_sq) / (np.sqrt(total_base_sq) + 1.0e-12))
+    mean_abs = float(total_abs / max(total_count, 1))
+
+    return noisy, {
+        'noise_enabled': True,
+        'noise_scale': float(noise_scale),
+        'noise_rel_l2': rel_l2,
+        'noise_max_abs': max_abs,
+        'noise_mean_abs': mean_abs,
+    }
+
+
+def build_candidate_parent_for_commitment(epoch, federation, honest_aggregated_state, logger):
+    """
+    Build the parent model the server will actually commit to the committee.
+
+    Honest path:
+      candidate = honest aggregated parent
+
+    Malicious replay path on attack_source_round:
+      candidate = replay of the parent used in this round (federation.initial_parent_state),
+      optionally with additive noise
+    """
+    attack_enabled = bool(cfg.get('attack_commit_enabled', True))
+    attack_source_round = int(cfg.get('attack_source_round', 3))
+    attack_replay_round = int(cfg.get('attack_replay_round', 4))
+    commit_noise_scale = float(cfg.get('attack_commit_noise_scale', 0.0))
+
+    previous_parent_state = clone_state_dict(federation.initial_parent_state)
+    honest_parent_state = clone_state_dict(honest_aggregated_state)
+
+    previous_hash = round_log.hash_state_dict(previous_parent_state)
+    honest_hash = round_log.hash_state_dict(honest_parent_state)
+
+    if attack_enabled and int(epoch) == attack_source_round:
+        candidate_state = clone_state_dict(previous_parent_state)
+        candidate_source = 'replay_previous_parent'
+        noise_report = {
+            'noise_enabled': False,
+            'noise_scale': 0.0,
+            'noise_rel_l2': 0.0,
+            'noise_max_abs': 0.0,
+            'noise_mean_abs': 0.0,
+        }
+
+        if commit_noise_scale > 0.0:
+            candidate_state, noise_report = add_uniform_noise_to_state_dict(candidate_state, commit_noise_scale)
+            candidate_source = 'replay_previous_parent_plus_noise'
+    else:
+        candidate_state = clone_state_dict(honest_parent_state)
+        candidate_source = 'honest_aggregate'
+        noise_report = {
+            'noise_enabled': False,
+            'noise_scale': 0.0,
+            'noise_rel_l2': 0.0,
+            'noise_max_abs': 0.0,
+            'noise_mean_abs': 0.0,
+        }
+
+    candidate_hash = round_log.hash_state_dict(candidate_state)
+
+    candidate_meta = {
+        'candidate_source': candidate_source,
+        'round_produced': int(epoch),
+        'target_parent_round': int(epoch) + 1,
+        'attack_source_round': attack_source_round,
+        'attack_replay_round': attack_replay_round,
+        'previous_parent_hash': previous_hash,
+        'honest_aggregated_hash': honest_hash,
+        'candidate_hash': candidate_hash,
+        'relative_change_vs_previous_parent': state_dict_relative_l2(previous_parent_state, candidate_state),
+        'relative_change_vs_honest_aggregated': state_dict_relative_l2(honest_parent_state, candidate_state),
+        **noise_report,
+    }
+
+    if cfg.get('debug_attack_replay', False):
+        logger.append({
+            'info': [
+                f'[REPLAY] round_produced={epoch}',
+                f'[REPLAY] target_parent_round={epoch + 1}',
+                f'[REPLAY] source={candidate_meta["candidate_source"]}',
+                f'[REPLAY] previous_parent_hash={candidate_meta["previous_parent_hash"]}',
+                f'[REPLAY] honest_aggregated_hash={candidate_meta["honest_aggregated_hash"]}',
+                f'[REPLAY] candidate_hash={candidate_meta["candidate_hash"]}',
+                f'[REPLAY] rel_change_vs_prev={candidate_meta["relative_change_vs_previous_parent"]:.6e}',
+                f'[REPLAY] rel_change_vs_honest={candidate_meta["relative_change_vs_honest_aggregated"]:.6e}',
+                f'[REPLAY] noise_enabled={candidate_meta["noise_enabled"]}',
+                f'[REPLAY] noise_scale={candidate_meta["noise_scale"]}',
+                f'[REPLAY] noise_rel_l2={candidate_meta["noise_rel_l2"]:.6e}',
+                f'[REPLAY] noise_max_abs={candidate_meta["noise_max_abs"]:.6e}',
+                f'[REPLAY] noise_mean_abs={candidate_meta["noise_mean_abs"]:.6e}',
+            ]
+        }, 'train', mean=False)
+
+    return candidate_state, candidate_meta
 
 def select_verifiers(local, user_idx, federation):
     """
@@ -148,7 +318,17 @@ def select_verifiers(local, user_idx, federation):
     return list(selected.values())
 
 
-def verify_and_commit_candidate_parent(round_log, epoch, candidate_state_dict, local, user_idx, federation, label_split, logger):
+def verify_and_commit_candidate_parent(
+    round_log,
+    epoch,
+    candidate_state_dict,
+    local,
+    user_idx,
+    federation,
+    label_split,
+    logger,
+    candidate_meta=None,
+):
     """
     Prototype-2 verifier rule:
     - one verifier per cohort
@@ -159,15 +339,30 @@ def verify_and_commit_candidate_parent(round_log, epoch, candidate_state_dict, l
     previous_parent_record = round_log.get_latest_approved_parent()
     previous_parent_state = round_log.load_parent_state_dict(previous_parent_record)
 
+    committee = select_verifiers(local, user_idx, federation)
     verifier_reports = []
 
-    for _, verifier_user_id, verifier_local in select_verifiers(local, user_idx, federation):
+    if cfg.get('debug_commitment', False):
+        committee_desc = [
+            f'(slot={slot}, user={verifier_user_id}, rate={float(verifier_local.model_rate)})'
+            for slot, verifier_user_id, verifier_local in committee
+        ]
+        logger.append({
+            'info': [
+                f'[COMMIT] target_parent_round={epoch + 1}',
+                f'[COMMIT] candidate_source={candidate_meta.get("candidate_source", "unknown") if candidate_meta else "unknown"}',
+                f'[COMMIT] committee={committee_desc}',
+            ]
+        }, 'train', mean=False)
+
+    for _, verifier_user_id, verifier_local in committee:
         prev_federation = Federation(
             epoch + 1,
             copy.deepcopy(previous_parent_state),
             cfg['model_rate'],
             label_split
         )
+
         cand_federation = Federation(
             epoch + 1,
             copy.deepcopy(candidate_state_dict),
@@ -213,7 +408,7 @@ def verify_and_commit_candidate_parent(round_log, epoch, candidate_state_dict, l
             approved = False
             reason = 'candidate too similar to previous approved parent'
 
-        verifier_reports.append({
+        report = {
             'user_id': int(verifier_user_id),
             'cohort_rate': cohort_rate,
             'approved': approved,
@@ -221,7 +416,22 @@ def verify_and_commit_candidate_parent(round_log, epoch, candidate_state_dict, l
             'prev_eval': prev_eval,
             'cand_eval': cand_eval,
             'relative_change': rel_change,
-        })
+        }
+        verifier_reports.append(report)
+
+        if cfg.get('debug_commitment', False):
+            logger.append({
+                'info': [
+                    f'[COMMIT][Verifier {verifier_user_id}] cohort_rate={cohort_rate}',
+                    f'[COMMIT][Verifier {verifier_user_id}] approved={approved}',
+                    f'[COMMIT][Verifier {verifier_user_id}] reason={reason}',
+                    f'[COMMIT][Verifier {verifier_user_id}] prev_loss={prev_eval["Local-Loss"]:.6f}',
+                    f'[COMMIT][Verifier {verifier_user_id}] cand_loss={cand_eval["Local-Loss"]:.6f}',
+                    f'[COMMIT][Verifier {verifier_user_id}] prev_acc={prev_eval["Local-Accuracy"]:.6f}',
+                    f'[COMMIT][Verifier {verifier_user_id}] cand_acc={cand_eval["Local-Accuracy"]:.6f}',
+                    f'[COMMIT][Verifier {verifier_user_id}] rel_change={rel_change:.6e}',
+                ]
+            }, 'train', mean=False)
 
     active_user_model_rates = {
         int(uid): float(federation.model_rate[uid]) for uid in user_idx
@@ -233,14 +443,17 @@ def verify_and_commit_candidate_parent(round_log, epoch, candidate_state_dict, l
         active_users=user_idx,
         active_user_model_rates=active_user_model_rates,
         verifier_reports=verifier_reports,
+        candidate_metadata=candidate_meta,
     )
 
     logger.append({
         'info': [
             f'Prototype-2 commitment check for round {epoch + 1}',
+            f'candidate source: {candidate_meta.get("candidate_source", "unknown") if candidate_meta else "unknown"}',
             f'commitment approved: {event["approved"]}',
             f'approved cohorts: {event["approved_cohort_rates"]}',
             f'required cohorts: {event["required_cohort_rates"]}',
+            f'candidate hash: {event["model_hash"]}',
         ]
     }, 'train', mean=False)
 
@@ -362,7 +575,7 @@ def runExperiment():
 def train(model_history_block2, model_history_fcnn, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, round_log):
     global_model.load_state_dict(federation.global_parameters)
     global_model.train(True)
-    local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, round_log)
+    local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, round_log, logger)
     num_active_users = len(local)
 
     lr = optimizer.param_groups[0]['lr']
@@ -391,19 +604,97 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
             logger.write('train', cfg['metric_name']['train']['Local'])   
     
     federation.combine(local_parameters, param_idx, user_idx)
-    #global_model.load_state_dict(federation.global_parameters)
-    
-    commitment_event = verify_and_commit_candidate_parent(round_log,epoch,copy.deepcopy(federation.global_parameters),local,
-    user_idx,federation,label_split,logger,)
+
+    honest_aggregated_state = clone_state_dict(federation.global_parameters)
+
+    candidate_parent_state, candidate_meta = build_candidate_parent_for_commitment(
+        epoch,
+        federation,
+        honest_aggregated_state,
+        logger,
+    )
+
+    commitment_event = verify_and_commit_candidate_parent(
+        round_log,
+        epoch,
+        copy.deepcopy(candidate_parent_state),
+        local,
+        user_idx,
+        federation,
+        label_split,
+        logger,
+        candidate_meta=candidate_meta,
+    )
+
+    final_parent_state = None
 
     if commitment_event['approved']:
-        global_model.load_state_dict(federation.global_parameters)
+        final_parent_state = clone_state_dict(candidate_parent_state)
+
     else:
-        approved_parent_record = round_log.get_latest_approved_parent()
-        rollback_state = round_log.load_parent_state_dict(approved_parent_record)
-        rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
-        federation.global_parameters = copy.deepcopy(rollback_state)
-        global_model.load_state_dict(rollback_state)
+        rejection_response = cfg.get('commit_rejection_response', 'rollback_previous')
+
+        logger.append({
+            'info': [
+                f'[COMMIT] primary candidate rejected for round {epoch + 1}',
+                f'[COMMIT] rejection_response={rejection_response}',
+                f'[COMMIT] rejected_commitment_id={commitment_event["commitment_id"]}',
+            ]
+        }, 'train', mean=False)
+
+        if rejection_response == 'abort':
+            raise RuntimeError(
+                f'Candidate parent rejected for round {epoch + 1}: {commitment_event["commitment_id"]}'
+            )
+
+        elif rejection_response == 'fallback_honest':
+            fallback_meta = {
+                'candidate_source': 'honest_fallback_after_reject',
+                'round_produced': int(epoch),
+                'target_parent_round': int(epoch) + 1,
+                'previous_parent_hash': round_log.hash_state_dict(federation.initial_parent_state),
+                'honest_aggregated_hash': round_log.hash_state_dict(honest_aggregated_state),
+                'candidate_hash': round_log.hash_state_dict(honest_aggregated_state),
+                'relative_change_vs_previous_parent': state_dict_relative_l2(
+                    federation.initial_parent_state, honest_aggregated_state
+                ),
+                'relative_change_vs_honest_aggregated': 0.0,
+                'noise_enabled': False,
+                'noise_scale': 0.0,
+                'noise_rel_l2': 0.0,
+                'noise_max_abs': 0.0,
+                'noise_mean_abs': 0.0,
+                'fallback_triggered_by_commitment_id': commitment_event['commitment_id'],
+            }
+
+            fallback_event = verify_and_commit_candidate_parent(
+                round_log,
+                epoch,
+                copy.deepcopy(honest_aggregated_state),
+                local,
+                user_idx,
+                federation,
+                label_split,
+                logger,
+                candidate_meta=fallback_meta,
+            )
+
+            if fallback_event['approved']:
+                final_parent_state = clone_state_dict(honest_aggregated_state)
+            else:
+                approved_parent_record = round_log.get_latest_approved_parent()
+                rollback_state = round_log.load_parent_state_dict(approved_parent_record)
+                rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
+                final_parent_state = clone_state_dict(rollback_state)
+
+        else:
+            approved_parent_record = round_log.get_latest_approved_parent()
+            rollback_state = round_log.load_parent_state_dict(approved_parent_record)
+            rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
+            final_parent_state = clone_state_dict(rollback_state)
+
+    federation.global_parameters = clone_state_dict(final_parent_state)
+    global_model.load_state_dict(final_parent_state)
     global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
 
     # Append to the model history. 
@@ -644,7 +935,7 @@ def cast_local_parameters_to_reference(local_parameters, expected_local_paramete
                 fixed[m][k] = local_parameters[m][k]
     return fixed
 
-def make_local(dataset, data_split, label_split, federation, round_log):
+def make_local(dataset, data_split, label_split, federation, round_log, logger):
     num_active_users = int(np.ceil(cfg['frac'] * cfg['num_users']))
     user_idx = torch.arange(cfg['num_users'])[torch.randperm(cfg['num_users'])[:num_active_users]].tolist()
 
@@ -672,6 +963,21 @@ def make_local(dataset, data_split, label_split, federation, round_log):
             local_parameters[m],
             expected_local_parameters[m]
         )
+
+        if cfg.get('debug_extraction', False):
+            received_hash = hash_local_parameter_dict(local_parameters[m])
+            expected_hash = hash_local_parameter_dict(expected_local_parameters[m])
+
+            logger.append({
+                'info': [
+                    f'[EXTRACT][Round {federation.rd}] user={int(user_idx[m])}',
+                    f'[EXTRACT][Round {federation.rd}] rate={float(model_rate_m)}',
+                    f'[EXTRACT][Round {federation.rd}] received_hash={received_hash}',
+                    f'[EXTRACT][Round {federation.rd}] expected_hash={expected_hash}',
+                    f'[EXTRACT][Round {federation.rd}] match={local[m].trusted_round}',
+                    f'[EXTRACT][Round {federation.rd}] reason={local[m].validation_reason}',
+                ]
+            }, 'train', mean=False)
 
     return local, local_parameters, user_idx, param_idx
 
