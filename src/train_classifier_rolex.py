@@ -576,8 +576,8 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
     global_model.load_state_dict(federation.global_parameters)
     global_model.train(True)
     local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, round_log, logger)
+    distributed_local_parameters = copy.deepcopy(local_parameters)
     num_active_users = len(local)
-
     lr = optimizer.param_groups[0]['lr']
 
     start_time = time.time()
@@ -701,46 +701,85 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
     if cfg['model_name'] == 'fcnn':
         targetWeights = ['layers.0.weight']
         targetBiases = ['layers.0.bias']
+
+        attack_source_round = int(cfg.get('attack_source_round', 3))
+        attack_replay_round = int(cfg.get('attack_replay_round', 4))
+
         for m in range(num_active_users):
             weight_grad = None
             bias_grad = None
+
             max_pearson_overall = 0.0
             max_psnr_overall = 0.0
             max_pearson_list = []
             max_psnr_list = []
             num_recovered_list = []
-            for k, v in global_model_state_dict_copy.items():
-                if federation.model_rate[user_idx[m]] == 0.25:
-                    if (k in targetWeights or k in targetBiases):
-                            model_history_fcnn[k].append(global_model_state_dict_copy[k])
-                            if (epoch == 2): 
-                                
-                                if k in targetWeights:
-                                    weight_grad = fcnn_leakage(k, user_idx[m], num_active_users, federation.model_rate[user_idx[m]], local_parameters[m][k], model_history_fcnn[k], federation.model_to_distribute[k])
-                                else:
-                                    bias_grad = fcnn_leakage(k, user_idx[m], num_active_users, federation.model_rate[user_idx[m]], local_parameters[m][k], model_history_fcnn[k], federation.model_to_distribute[k])
-                                
-                                # print("For epoch %s, weight_grad = %s and bias_grad = %s"%(epoch, weight_grad, bias_grad))
 
-                            # max_overall_avgs = []
-                            if (weight_grad is not None and bias_grad is not None):
-                                bias_grad_sum = torch.abs(torch.sum(bias_grad)).item()
-                                if bias_grad_sum != 0.0:
-                                    if img_list is not None and len(img_list) > 0:
-                                        (max_pearson, max_psnr, num_recovered) = reconstruct_image(weight_grad, bias_grad, img_list)
-                                        max_pearson_overall = max(max_pearson_overall, max_pearson)
-                                        max_psnr_overall = max(max_psnr_overall, max_psnr)
-                                        max_pearson_list.append(max_pearson)
-                                        max_psnr_list.append(max_psnr)
-                                        num_recovered_list.append(num_recovered)
-                                    else:
-                                        print("RECONSTRUCT: skipped because no local image batch was recorded this round")
+            # Only target the 0.25 cohort
+            if federation.model_rate[user_idx[m]] != 0.25:
+                continue
+
+            for k, v in global_model_state_dict_copy.items():
+                if k in targetWeights or k in targetBiases:
+                    model_history_fcnn[k].append(global_model_state_dict_copy[k])
+
+                    # Run leakage only on the replay round, not hardcoded round 2
+                    if epoch == attack_replay_round and len(model_history_fcnn[k]) >= 2:
+                        distributed_model = distributed_local_parameters[m][k]
+
+                        if cfg.get('debug_attack_replay', False):
+                            print(
+                                f"[REPLAY][LEAKAGE] epoch={epoch} user={user_idx[m]} key={k} "
+                                f"rate={federation.model_rate[user_idx[m]]} "
+                                f"dist_shape={tuple(distributed_model.shape)} "
+                                f"hist_len={len(model_history_fcnn[k])}",
+                                flush=True
+                            )
+                        if k in targetWeights:
+                            weight_grad = fcnn_leakage(
+                                k,
+                                user_idx[m],
+                                num_active_users,
+                                federation.model_rate[user_idx[m]],
+                                local_parameters[m][k],
+                                model_history_fcnn[k],
+                                distributed_model
+                            )
+                        else:
+                            bias_grad = fcnn_leakage(
+                                k,
+                                user_idx[m],
+                                num_active_users,
+                                federation.model_rate[user_idx[m]],
+                                local_parameters[m][k],
+                                model_history_fcnn[k],
+                                distributed_model
+                            )
+
+            if weight_grad is not None and bias_grad is not None:
+                bias_grad_sum = torch.abs(torch.sum(bias_grad)).item()
+
+                if bias_grad_sum != 0.0:
+                    if img_list is not None and len(img_list) > 0:
+                        (max_pearson, max_psnr, num_recovered) = reconstruct_image(
+                            weight_grad, bias_grad, img_list
+                        )
+                        max_pearson_overall = max(max_pearson_overall, max_pearson)
+                        max_psnr_overall = max(max_psnr_overall, max_psnr)
+                        max_pearson_list.append(max_pearson)
+                        max_psnr_list.append(max_psnr)
+                        num_recovered_list.append(num_recovered)
+                    else:
+                        print("RECONSTRUCT: skipped because no local image batch was recorded this round")
+
             if len(max_pearson_list) > 0:
                 N_Table = cfg['local_train_size']
                 Max_Pearson_Table = max(max_pearson_list)
                 Max_PSNR_Table = max(max_psnr_list)
                 Max_Recovered_Table = max(num_recovered_list)
-                fp.write("%s %s %s %s\n"%(N_Table, Max_Pearson_Table, Max_PSNR_Table, Max_Recovered_Table))
+                fp.write("%s %s %s %s\n" % (
+                    N_Table, Max_Pearson_Table, Max_PSNR_Table, Max_Recovered_Table
+                ))
 
 
     if cfg['model_name'] == 'conv':
@@ -845,23 +884,32 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
 
 
 
-def fcnn_leakage(k, user, num_active_users, model_rate, local_params, model_history, distributed_model):
-    hidden_layer_size = model_history[0].size()[0]
+def fcnn_leakage(k, user, num_active_users, model_rate, local_params_after_train, model_history, distributed_model):
+    """
+    Reconstruct the target user's gradient using:
+      - model_history[-2] = aggregated parent after the source round
+      - model_history[-1] = aggregated parent after the replay round
+      - distributed_model  = the actual local slice sent to the target at replay round
+    """
+    if len(model_history) < 2:
+        return None
+
+    hidden_layer_size = model_history[-2].size()[0]
     client_cap = int(model_rate * hidden_layer_size)
+
     lower = client_cap
     upper = lower + client_cap
-    
-    agg_val_rd_0 = torch.multiply(model_history[0][lower:upper], num_active_users - 1) # A + B
-    agg_val_rd_1 = torch.multiply(model_history[1][lower:upper], num_active_users) # A + B + C
 
-    agg_diff = torch.subtract(agg_val_rd_1, agg_val_rd_0)
-    # print("FCNN_LEAKAGE: agg_diff = %s and local_params = %s"%(agg_diff, local_params))
-    server_error = torch.abs(torch.subtract(agg_diff, local_params))
-    # print("FCNN_LEAKAGE: server_error = %s"%(server_error))
+    # Round t source aggregate contribution over the shifted block
+    agg_val_prev = torch.multiply(model_history[-2][lower:upper], num_active_users - 1)
+
+    # Round t+1 replay aggregate contribution over the shifted block
+    agg_val_curr = torch.multiply(model_history[-1][lower:upper], num_active_users)
+
+    agg_diff = torch.subtract(agg_val_curr, agg_val_prev)
 
     malicious_model_sent = distributed_model.to(cfg["device"])
     user_grad = torch.subtract(malicious_model_sent, agg_diff)
-    # print("FCNN_LEAKAGE: user_grad = %s"%(user_grad))
     return user_grad
 
 def gradient_leakage(k, user, num_active_users, model_rate, local_params, global_params_list):
