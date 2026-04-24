@@ -70,7 +70,7 @@ attack_commit_noise_scale: 0.0
 
 # what to do if the replay candidate is rejected
 # options: rollback_previous, fallback_honest, abort
-commit_rejection_response: abort
+commit_rejection_response: rollback_previous
 
 # terminal debug
 debug_commitment: true
