@@ -646,13 +646,13 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
     )
 
     final_parent_state = None
+    round_was_skipped = False
+    round_skip_reason = None
 
     if commitment_event['approved']:
         final_parent_state = clone_state_dict(candidate_parent_state)
-
     else:
         rejection_response = cfg.get('commit_rejection_response', 'rollback_previous')
-
         logger.append({
             'info': [
                 f'[COMMIT] primary candidate rejected for round {epoch + 1}',
@@ -705,20 +705,46 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
                 rollback_state = round_log.load_parent_state_dict(approved_parent_record)
                 rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
                 final_parent_state = clone_state_dict(rollback_state)
+                round_was_skipped = True
+                round_skip_reason = 'fallback_honest_rejected'
 
-        else:
+        elif rejection_response == 'rollback_previous':
             approved_parent_record = round_log.get_latest_approved_parent()
             rollback_state = round_log.load_parent_state_dict(approved_parent_record)
             rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
             final_parent_state = clone_state_dict(rollback_state)
+            round_was_skipped = True
+            round_skip_reason = 'candidate_rejected_rollback_previous'
+
+        else:
+            raise ValueError(f"Unknown commit_rejection_response: {rejection_response}")
 
     federation.global_parameters = clone_state_dict(final_parent_state)
     global_model.load_state_dict(final_parent_state)
     global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
+    if round_was_skipped:
+        logger.append({
+            'info': [
+                f'[ROUND-SKIP] epoch={epoch}',
+                f'[ROUND-SKIP] reason={round_skip_reason}',
+                f'[ROUND-SKIP] next_parent_hash={round_log.hash_state_dict(final_parent_state)}',
+                '[ROUND-SKIP] rejected round update was discarded; training will continue next epoch from last approved parent',
+            ]
+        }, 'train', mean=False)
+
+        print(
+            f"[ROUND-SKIP] epoch={epoch} reason={round_skip_reason} "
+            f"training continues from last approved parent",
+            flush=True
+        )
     if cfg['model_name'] == 'fcnn':
         attack_replay_round = int(cfg.get('attack_replay_round', 4))
 
-        if epoch == attack_replay_round:
+        if round_was_skipped:
+            # Rejected round must not become the replay result used by inversion
+            fcnn_attack_cache['replay_result_parent'].clear()
+
+        elif epoch == attack_replay_round:
             for key in ['layers.0.weight', 'layers.0.bias']:
                 fcnn_attack_cache['replay_result_parent'][key] = global_model_state_dict_copy[key].detach().clone()
 
@@ -746,7 +772,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
 
             for k, v in global_model_state_dict_copy.items():
                 if k in targetWeights or k in targetBiases:
-                    if epoch == attack_replay_round:
+                    if epoch == attack_replay_round and not round_was_skipped:
                         distributed_model = distributed_local_parameters[m][k]
 
                         num_source_contributors, num_replay_contributors = get_fcnn_shifted_block_contributor_counts(
