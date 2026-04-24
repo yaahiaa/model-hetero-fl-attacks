@@ -246,8 +246,8 @@ def build_candidate_parent_for_commitment(epoch, federation, honest_aggregated_s
     previous_parent_state = clone_state_dict(federation.initial_parent_state)
     honest_parent_state = clone_state_dict(honest_aggregated_state)
 
-    previous_hash = round_log.hash_state_dict(previous_parent_state)
-    honest_hash = round_log.hash_state_dict(honest_parent_state)
+    previous_hash = round_log_module.hash_state_dict(previous_parent_state)
+    honest_hash = round_log_module.hash_state_dict(honest_parent_state)
 
     if attack_enabled and int(epoch) == attack_source_round:
         candidate_state = clone_state_dict(previous_parent_state)
@@ -274,7 +274,7 @@ def build_candidate_parent_for_commitment(epoch, federation, honest_aggregated_s
             'noise_mean_abs': 0.0,
         }
 
-    candidate_hash = round_log.hash_state_dict(candidate_state)
+    candidate_hash = round_log_module.hash_state_dict(candidate_state)
 
     candidate_meta = {
         'candidate_source': candidate_source,
@@ -324,7 +324,7 @@ def select_verifiers(local, user_idx, federation):
 
 
 def verify_and_commit_candidate_parent(
-    round_log,
+    round_log_module,
     epoch,
     candidate_state_dict,
     local,
@@ -341,8 +341,8 @@ def verify_and_commit_candidate_parent(
     - use small private validation and relative model change
     - write approval / rejection into the non-server-controlled log
     """
-    previous_parent_record = round_log.get_latest_approved_parent()
-    previous_parent_state = round_log.load_parent_state_dict(previous_parent_record)
+    previous_parent_record = round_log_module.get_latest_approved_parent()
+    previous_parent_state = round_log_module.load_parent_state_dict(previous_parent_record)
 
     committee = select_verifiers(local, user_idx, federation)
     verifier_reports = []
@@ -442,7 +442,7 @@ def verify_and_commit_candidate_parent(
         int(uid): float(federation.model_rate[uid]) for uid in user_idx
     }
 
-    event = round_log.record_candidate_parent(
+    event = round_log_module.record_candidate_parent(
         epoch=epoch,
         state_dict=copy.deepcopy(candidate_state_dict),
         active_users=user_idx,
@@ -514,8 +514,8 @@ def runExperiment():
         data_split, label_split = split_dataset(dataset, cfg['num_users'], cfg['data_split_mode'])
     global_parameters = model.state_dict()
 
-    round_log = TransparencyLog(cfg['round_log_dir'])
-    round_log.bootstrap_initial_parent(global_parameters, parent_for_round=1)
+    round_log_module = TransparencyLog(cfg['round_log_dir'])
+    round_log_module.bootstrap_initial_parent(global_parameters, parent_for_round=1)
 
     model_history_block2 = {}
     model_history_block2['blocks.2.weight'] = []
@@ -540,8 +540,8 @@ def runExperiment():
     for epoch in range(last_epoch, cfg['num_epochs']['global'] + 1):
         logger.safe(True)
 
-        approved_parent_record = round_log.get_latest_approved_parent()
-        approved_parent_state = round_log.load_parent_state_dict(approved_parent_record)
+        approved_parent_record = round_log_module.get_latest_approved_parent()
+        approved_parent_state = round_log_module.load_parent_state_dict(approved_parent_record)
         approved_parent_state = move_state_dict_to_device(approved_parent_state, cfg['device'])
         global_parameters = copy.deepcopy(approved_parent_state)
 
@@ -558,7 +558,7 @@ def runExperiment():
             optimizer,
             logger,
             epoch,
-            round_log
+            round_log_module
         )
         test_model = stats(dataset['train'], model)
         test(dataset['test'], data_split['test'], label_split, test_model, logger, epoch)
@@ -1068,7 +1068,7 @@ def cast_local_parameters_to_reference(local_parameters, expected_local_paramete
                 fixed[m][k] = local_parameters[m][k]
     return fixed
 
-def make_local(dataset, data_split, label_split, federation, round_log, logger):
+def make_local(dataset, data_split, label_split, federation, round_log_module, logger):
     num_active_users = int(np.ceil(cfg['frac'] * cfg['num_users']))
     user_idx = torch.arange(cfg['num_users'])[torch.randperm(cfg['num_users'])[:num_active_users]].tolist()
 
