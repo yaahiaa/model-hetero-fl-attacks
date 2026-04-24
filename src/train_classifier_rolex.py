@@ -592,25 +592,22 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
     if runtime_control.get('skip_next_epoch', False):
         runtime_control['skip_next_epoch'] = False
         skip_reason = runtime_control.get('skip_reason', 'rejected_previous_round')
+        runtime_control['skip_reason'] = None
 
         logger.append({
             'info': [
                 f'[EPOCH-NOOP] epoch={epoch}',
                 f'[EPOCH-NOOP] reason={skip_reason}',
-                '[EPOCH-NOOP] local training, aggregation, commitment, and reconstruction were skipped',
+                '[EPOCH-NOOP] local training, aggregation, commitment, reconstruction, and test evaluation were skipped',
             ]
         }, 'train', mean=False)
 
         print(
             f"[EPOCH-NOOP] epoch={epoch} reason={skip_reason} "
-            f"local training/aggregation/commitment/reconstruction skipped",
+            f"local training/aggregation/commitment/reconstruction/test skipped",
             flush=True
         )
 
-        # Keep current approved parent; just evaluate and return
-        global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
-        test_model = stats(dataset['test'], model)
-        logger.append(test_model, 'test', mean=False)
         return
     global_model.train(True)
     local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, transparency_log, logger)
