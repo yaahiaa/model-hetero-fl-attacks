@@ -221,6 +221,11 @@ def add_uniform_noise_to_state_dict(state_dict, noise_scale):
         'noise_mean_abs': mean_abs,
     }
 
+def get_fcnn_shifted_block_contributor_counts(federation, user_idx, target_rate=0.25):
+    active_rates = [float(federation.model_rate[u]) for u in user_idx]
+    num_source_contributors = sum(1 for r in active_rates if r > target_rate)
+    num_replay_contributors = sum(1 for r in active_rates if r >= target_rate)
+    return num_source_contributors, num_replay_contributors
 
 def build_candidate_parent_for_commitment(epoch, federation, honest_aggregated_state, logger):
     """
@@ -526,6 +531,10 @@ def runExperiment():
     model_history_fcnn = {}
     model_history_fcnn['layers.0.weight'] = []
     model_history_fcnn['layers.0.bias'] = []
+    fcnn_attack_cache = {
+    'source_honest_parent': {},
+    'replay_result_parent': {},
+}
 
 
     for epoch in range(last_epoch, cfg['num_epochs']['global'] + 1):
@@ -572,7 +581,7 @@ def runExperiment():
     return
 
 
-def train(model_history_block2, model_history_fcnn, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, round_log):
+def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, round_log):
     global_model.load_state_dict(federation.global_parameters)
     global_model.train(True)
     local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, round_log, logger)
@@ -582,12 +591,14 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
 
     start_time = time.time()
 
-    img_list = None
+    img_list_by_user = {}
+
     for m in range(num_active_users):
-        lr = cfg['lr_map'][federation.model_rate[user_idx[m]]] # This line modifies the learning rate based on user. 
+        lr = cfg['lr_map'][federation.model_rate[user_idx[m]]]
         (local_parameters[m], img_data) = copy.deepcopy(local[m].train(local_parameters[m], lr, logger))
+
         if img_data:
-            img_list = copy.deepcopy(img_data)
+            img_list_by_user[int(user_idx[m])] = copy.deepcopy(img_data)
         if m % int((num_active_users * cfg['log_interval']) + 1) == 0:
             local_time = (time.time() - start_time) / (m + 1)
             epoch_finished_time = datetime.timedelta(seconds=local_time * (num_active_users - m - 1))
@@ -606,6 +617,13 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
     federation.combine(local_parameters, param_idx, user_idx)
 
     honest_aggregated_state = clone_state_dict(federation.global_parameters)
+    if cfg['model_name'] == 'fcnn':
+        attack_source_round = int(cfg.get('attack_source_round', 3))
+        attack_replay_round = int(cfg.get('attack_replay_round', 4))
+
+        if epoch == attack_source_round:
+            for key in ['layers.0.weight', 'layers.0.bias']:
+                fcnn_attack_cache['source_honest_parent'][key] = clone_state_dict(honest_aggregated_state)[key]
 
     candidate_parent_state, candidate_meta = build_candidate_parent_for_commitment(
         epoch,
@@ -696,6 +714,12 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
     federation.global_parameters = clone_state_dict(final_parent_state)
     global_model.load_state_dict(final_parent_state)
     global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
+    if cfg['model_name'] == 'fcnn':
+        attack_replay_round = int(cfg.get('attack_replay_round', 4))
+
+        if epoch == attack_replay_round:
+            for key in ['layers.0.weight', 'layers.0.bias']:
+                fcnn_attack_cache['replay_result_parent'][key] = global_model_state_dict_copy[key].detach().clone()
 
     # Append to the model history. 
     if cfg['model_name'] == 'fcnn':
@@ -721,56 +745,64 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
 
             for k, v in global_model_state_dict_copy.items():
                 if k in targetWeights or k in targetBiases:
-                    model_history_fcnn[k].append(global_model_state_dict_copy[k])
-
-                    # Run leakage only on the replay round, not hardcoded round 2
-                    if epoch == attack_replay_round and len(model_history_fcnn[k]) >= 2:
+                    if epoch == attack_replay_round:
                         distributed_model = distributed_local_parameters[m][k]
+
+                        num_source_contributors, num_replay_contributors = get_fcnn_shifted_block_contributor_counts(
+                            federation, user_idx, target_rate=0.25
+                        )
+
+                        source_parent_tensor = fcnn_attack_cache['source_honest_parent'].get(k, None)
+                        replay_parent_tensor = fcnn_attack_cache['replay_result_parent'].get(k, None)
 
                         if cfg.get('debug_attack_replay', False):
                             print(
                                 f"[REPLAY][LEAKAGE] epoch={epoch} user={user_idx[m]} key={k} "
                                 f"rate={federation.model_rate[user_idx[m]]} "
                                 f"dist_shape={tuple(distributed_model.shape)} "
-                                f"hist_len={len(model_history_fcnn[k])}",
+                                f"src_count={num_source_contributors} "
+                                f"replay_count={num_replay_contributors} "
+                                f"have_source={source_parent_tensor is not None} "
+                                f"have_replay={replay_parent_tensor is not None}",
                                 flush=True
                             )
+
+                        recovered = fcnn_leakage_from_cache(
+                            key=k,
+                            model_rate=federation.model_rate[user_idx[m]],
+                            distributed_model=distributed_model,
+                            source_honest_parent=source_parent_tensor,
+                            replay_result_parent=replay_parent_tensor,
+                            num_source_contributors=num_source_contributors,
+                            num_replay_contributors=num_replay_contributors,
+                        )
+
                         if k in targetWeights:
-                            weight_grad = fcnn_leakage(
-                                k,
-                                user_idx[m],
-                                num_active_users,
-                                federation.model_rate[user_idx[m]],
-                                local_parameters[m][k],
-                                model_history_fcnn[k],
-                                distributed_model
-                            )
+                            weight_grad = recovered
                         else:
-                            bias_grad = fcnn_leakage(
-                                k,
-                                user_idx[m],
-                                num_active_users,
-                                federation.model_rate[user_idx[m]],
-                                local_parameters[m][k],
-                                model_history_fcnn[k],
-                                distributed_model
-                            )
+                            bias_grad = recovered
 
             if weight_grad is not None and bias_grad is not None:
                 bias_grad_sum = torch.abs(torch.sum(bias_grad)).item()
 
                 if bias_grad_sum != 0.0:
-                    if img_list is not None and len(img_list) > 0:
+                    target_img_list = img_list_by_user.get(int(user_idx[m]), None)
+
+                    if target_img_list is not None and len(target_img_list) > 0:
                         (max_pearson, max_psnr, num_recovered) = reconstruct_image(
-                            weight_grad, bias_grad, img_list
+                            weight_grad, bias_grad, target_img_list
+                        )
+                    else:
+                        print(
+                            f"RECONSTRUCT: skipped because no image batch was recorded for target user {user_idx[m]}",
+                            flush=True
                         )
                         max_pearson_overall = max(max_pearson_overall, max_pearson)
                         max_psnr_overall = max(max_psnr_overall, max_psnr)
                         max_pearson_list.append(max_pearson)
                         max_psnr_list.append(max_psnr)
                         num_recovered_list.append(num_recovered)
-                    else:
-                        print("RECONSTRUCT: skipped because no local image batch was recorded this round")
+                    
 
             if len(max_pearson_list) > 0:
                 N_Table = cfg['local_train_size']
@@ -828,7 +860,13 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
         best_partial_recon = None
 
         for i in range(weight_grad.size()[0]):
-            partial_recon = torch.divide(weight_grad[i], bias_grad[i])
+            denom = bias_grad[i]
+            eps = 1.0e-8
+
+            if torch.abs(denom).item() < eps:
+                continue
+
+            partial_recon = weight_grad[i] / denom
 
             img_reshaped = elem_extracted.reshape(partial_recon.size())
 
@@ -856,7 +894,8 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
         avg_ssim.append(max_ssim)
         avg_psnr.append(max_psnr)
         avg_pearson.append(max_pearson)
-
+        if best_partial_recon is None:
+            continue
         partial_recon_as_img = best_partial_recon.reshape(elem_extracted.size())
 
         # axs[0, count].imshow(elem_extracted.cpu().numpy()[0], cmap='gray')
@@ -867,7 +906,9 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
         # plt.imshow(partial_recon_as_img.cpu().numpy()[0], cmap='gray')
         # fig_save_str = "New_Images/reconstructedConvRate_%s"%(count)
         # plt.savefig(fig_save_str)
-
+    if len(avg_pearson) == 0:
+        print("RECONSTRUCT: no valid partial reconstructions", flush=True)
+        return (0.0, 0.0, 0)
     print("RECONSTRUCT: best_ssim across images = %s"%(max(avg_ssim)))
     print("RECONSTRUCT: best_psnr across images = %s"%(max(avg_psnr)))
     print("RECONSTRUCT: best_pearson across images = %s"%(max(avg_pearson)))
@@ -884,32 +925,46 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
 
 
 
-def fcnn_leakage(k, user, num_active_users, model_rate, local_params_after_train, model_history, distributed_model):
+def fcnn_leakage_from_cache(
+    *,
+    key,
+    model_rate,
+    distributed_model,
+    source_honest_parent,
+    replay_result_parent,
+    num_source_contributors,
+    num_replay_contributors,
+):
     """
-    Reconstruct the target user's gradient using:
-      - model_history[-2] = aggregated parent after the source round
-      - model_history[-1] = aggregated parent after the replay round
-      - distributed_model  = the actual local slice sent to the target at replay round
+    Recover the target cohort's plaintext update on the shifted block.
+
+    source_honest_parent: honest aggregate after the source round
+    replay_result_parent: resulting parent after the replay round
+    distributed_model: actual local slice sent to the target client at replay round
     """
-    if len(model_history) < 2:
+
+    if source_honest_parent is None or replay_result_parent is None:
         return None
 
-    hidden_layer_size = model_history[-2].size()[0]
+    hidden_layer_size = source_honest_parent.size(0)
     client_cap = int(model_rate * hidden_layer_size)
 
     lower = client_cap
     upper = lower + client_cap
 
-    # Round t source aggregate contribution over the shifted block
-    agg_val_prev = torch.multiply(model_history[-2][lower:upper], num_active_users - 1)
+    # Aggregate over the shifted block:
+    # source round: only larger cohorts contribute
+    # replay round: larger cohorts + target cohort contribute
+    source_block = source_honest_parent[lower:upper]
+    replay_block = replay_result_parent[lower:upper]
 
-    # Round t+1 replay aggregate contribution over the shifted block
-    agg_val_curr = torch.multiply(model_history[-1][lower:upper], num_active_users)
+    agg_val_prev = source_block * float(num_source_contributors)
+    agg_val_curr = replay_block * float(num_replay_contributors)
 
-    agg_diff = torch.subtract(agg_val_curr, agg_val_prev)
-
+    agg_diff = agg_val_curr - agg_val_prev
     malicious_model_sent = distributed_model.to(cfg["device"])
-    user_grad = torch.subtract(malicious_model_sent, agg_diff)
+
+    user_grad = malicious_model_sent - agg_diff
     return user_grad
 
 def gradient_leakage(k, user, num_active_users, model_rate, local_params, global_params_list):
