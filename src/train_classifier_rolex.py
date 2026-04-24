@@ -549,6 +549,7 @@ def runExperiment():
         train(
             model_history_block2,
             model_history_fcnn,
+            fcnn_attack_cache,
             dataset['train'],
             data_split['train'],
             label_split,
