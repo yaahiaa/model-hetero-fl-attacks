@@ -7,6 +7,7 @@ import numpy as np
 import os
 import shutil
 import time
+import round_log
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -22,7 +23,6 @@ import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from torchvision import transforms
-import round_log as round_log_module
 from round_log import TransparencyLog
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -582,10 +582,10 @@ def runExperiment():
     return
 
 
-def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, round_log):
+def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, transparency_log):
     global_model.load_state_dict(federation.global_parameters)
     global_model.train(True)
-    local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, round_log, logger)
+    local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, transparency_log, logger)
     distributed_local_parameters = copy.deepcopy(local_parameters)
     num_active_users = len(local)
     lr = optimizer.param_groups[0]['lr']
@@ -634,7 +634,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
     )
 
     commitment_event = verify_and_commit_candidate_parent(
-        round_log,
+        transparency_log,
         epoch,
         copy.deepcopy(candidate_parent_state),
         local,
@@ -671,9 +671,9 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
                 'candidate_source': 'honest_fallback_after_reject',
                 'round_produced': int(epoch),
                 'target_parent_round': int(epoch) + 1,
-                'previous_parent_hash': round_log.hash_state_dict(federation.initial_parent_state),
-                'honest_aggregated_hash': round_log.hash_state_dict(honest_aggregated_state),
-                'candidate_hash': round_log.hash_state_dict(honest_aggregated_state),
+                'previous_parent_hash': transparency_log.hash_state_dict(federation.initial_parent_state),
+                'honest_aggregated_hash': transparency_log.hash_state_dict(honest_aggregated_state),
+                'candidate_hash': transparency_log.hash_state_dict(honest_aggregated_state),
                 'relative_change_vs_previous_parent': state_dict_relative_l2(
                     federation.initial_parent_state, honest_aggregated_state
                 ),
@@ -687,7 +687,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
             }
 
             fallback_event = verify_and_commit_candidate_parent(
-                round_log,
+                transparency_log,
                 epoch,
                 copy.deepcopy(honest_aggregated_state),
                 local,
@@ -701,16 +701,16 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
             if fallback_event['approved']:
                 final_parent_state = clone_state_dict(honest_aggregated_state)
             else:
-                approved_parent_record = round_log.get_latest_approved_parent()
-                rollback_state = round_log.load_parent_state_dict(approved_parent_record)
+                approved_parent_record = transparency_log.get_latest_approved_parent()
+                rollback_state = transparency_log.load_parent_state_dict(approved_parent_record)
                 rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
                 final_parent_state = clone_state_dict(rollback_state)
                 round_was_skipped = True
                 round_skip_reason = 'fallback_honest_rejected'
 
         elif rejection_response == 'rollback_previous':
-            approved_parent_record = round_log.get_latest_approved_parent()
-            rollback_state = round_log.load_parent_state_dict(approved_parent_record)
+            approved_parent_record = transparency_log.get_latest_approved_parent()
+            rollback_state = transparency_log.load_parent_state_dict(approved_parent_record)
             rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
             final_parent_state = clone_state_dict(rollback_state)
             round_was_skipped = True
@@ -723,7 +723,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
     global_model.load_state_dict(final_parent_state)
     global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
     if round_was_skipped:
-        next_parent_hash = round_log_module.hash_state_dict(final_parent_state)
+        next_parent_hash = transparency_log.hash_state_dict(final_parent_state)
 
         logger.append({
             'info': [
