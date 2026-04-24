@@ -7,7 +7,6 @@ import numpy as np
 import os
 import shutil
 import time
-import round_log
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -23,6 +22,7 @@ import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from torchvision import transforms
+import round_log as round_log_module
 from round_log import TransparencyLog
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -723,17 +723,20 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
     global_model.load_state_dict(final_parent_state)
     global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
     if round_was_skipped:
+        next_parent_hash = round_log_module.hash_state_dict(final_parent_state)
+
         logger.append({
             'info': [
                 f'[ROUND-SKIP] epoch={epoch}',
                 f'[ROUND-SKIP] reason={round_skip_reason}',
-                f'[ROUND-SKIP] next_parent_hash={round_log.hash_state_dict(final_parent_state)}',
+                f'[ROUND-SKIP] next_parent_hash={next_parent_hash}',
                 '[ROUND-SKIP] rejected round update was discarded; training will continue next epoch from last approved parent',
             ]
         }, 'train', mean=False)
 
         print(
             f"[ROUND-SKIP] epoch={epoch} reason={round_skip_reason} "
+            f"next_parent_hash={next_parent_hash} "
             f"training continues from last approved parent",
             flush=True
         )
