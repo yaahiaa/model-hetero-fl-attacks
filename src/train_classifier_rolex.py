@@ -7,7 +7,6 @@ import numpy as np
 import os
 import shutil
 import time
-import round_log
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -23,7 +22,8 @@ import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from torchvision import transforms
-from round_log import TransparencyLog
+import round_log as round_log_module
+from round_log import TransparencyLog, hash_state_dict
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 cudnn.benchmark = True
@@ -723,7 +723,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
     global_model.load_state_dict(final_parent_state)
     global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
     if round_was_skipped:
-        next_parent_hash = transparency_log.hash_state_dict(final_parent_state)
+        next_parent_hash = hash_state_dict(final_parent_state)
 
         logger.append({
             'info': [
