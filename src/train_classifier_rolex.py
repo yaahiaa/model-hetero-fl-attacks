@@ -562,7 +562,8 @@ def runExperiment():
             optimizer,
             logger,
             epoch,
-            round_log_module
+            round_log_module,
+            runtime_control
         )
         test_model = stats(dataset['train'], model)
         test(dataset['test'], data_split['test'], label_split, test_model, logger, epoch)
