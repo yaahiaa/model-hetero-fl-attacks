@@ -535,6 +535,10 @@ def runExperiment():
     'source_honest_parent': {},
     'replay_result_parent': {},
 }
+    runtime_control = {
+    'skip_next_epoch': False,
+    'skip_reason': None,
+}
 
 
     for epoch in range(last_epoch, cfg['num_epochs']['global'] + 1):
@@ -582,8 +586,31 @@ def runExperiment():
     return
 
 
-def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, transparency_log):
+def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, transparency_log, runtime_control):
     global_model.load_state_dict(federation.global_parameters)
+    if runtime_control.get('skip_next_epoch', False):
+        runtime_control['skip_next_epoch'] = False
+        skip_reason = runtime_control.get('skip_reason', 'rejected_previous_round')
+
+        logger.append({
+            'info': [
+                f'[EPOCH-NOOP] epoch={epoch}',
+                f'[EPOCH-NOOP] reason={skip_reason}',
+                '[EPOCH-NOOP] local training, aggregation, commitment, and reconstruction were skipped',
+            ]
+        }, 'train', mean=False)
+
+        print(
+            f"[EPOCH-NOOP] epoch={epoch} reason={skip_reason} "
+            f"local training/aggregation/commitment/reconstruction skipped",
+            flush=True
+        )
+
+        # Keep current approved parent; just evaluate and return
+        global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
+        test_model = stats(dataset['test'], model)
+        logger.append(test_model, 'test', mean=False)
+        return
     global_model.train(True)
     local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, transparency_log, logger)
     distributed_local_parameters = copy.deepcopy(local_parameters)
@@ -712,9 +739,10 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
             approved_parent_record = transparency_log.get_latest_approved_parent()
             rollback_state = transparency_log.load_parent_state_dict(approved_parent_record)
             rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
+
+            runtime_control['skip_next_epoch'] = True
+            runtime_control['skip_reason'] = 'candidate_rejected_round_voided'
             final_parent_state = clone_state_dict(rollback_state)
-            round_was_skipped = True
-            round_skip_reason = 'candidate_rejected_rollback_previous'
 
         else:
             raise ValueError(f"Unknown commit_rejection_response: {rejection_response}")
@@ -775,7 +803,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
 
             for k, v in global_model_state_dict_copy.items():
                 if k in targetWeights or k in targetBiases:
-                    if epoch == attack_replay_round and not round_was_skipped:
+                    if epoch == attack_replay_round and not round_was_skipped and not runtime_control.get('skip_next_epoch', False):
                         distributed_model = distributed_local_parameters[m][k]
 
                         num_source_contributors, num_replay_contributors = get_fcnn_shifted_block_contributor_counts(
