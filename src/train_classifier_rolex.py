@@ -60,6 +60,12 @@ cfg.setdefault('verifier_min_relative_change', 0.1)
 cfg.setdefault('verifier_max_relative_change', 0.6)
 # Warmup: do not apply structural drift bounds during the first few rounds
 cfg.setdefault('verifier_structure_warmup_rounds', 2)
+cfg.setdefault('verifier_behavior_freeze_enabled', True)
+# Minimum behavior movement expected when the model parameters changed.
+cfg.setdefault('verifier_min_behavior_loss_delta', 0.005)
+cfg.setdefault('verifier_min_behavior_acc_delta', 1.0e-9)
+# Only apply the freeze detector in the low/mid drift region.
+cfg.setdefault('verifier_behavior_freeze_max_relative_change', 0.20)
 full_path = os.getcwd() + "/" + cfg['file_output']
 fp = open(full_path, 'w')
 fp.write("N Max_Pearson Max_PSNR Max_Recovered\n")
@@ -140,6 +146,35 @@ def relative_model_change(prev_local_parameters, cand_local_parameters):
 
     denom = torch.norm(prev_vec, p=2).item() + 1.0e-12
     return float(torch.norm(cand_vec - prev_vec, p=2).item() / denom)
+
+def behavior_freeze_check(prev_eval, cand_eval, rel_change):
+    loss_delta = abs(float(cand_eval['Local-Loss']) - float(prev_eval['Local-Loss']))
+    acc_delta = abs(float(cand_eval['Local-Accuracy']) - float(prev_eval['Local-Accuracy']))
+
+    min_loss_delta = float(cfg.get('verifier_min_behavior_loss_delta', 0.005))
+    min_acc_delta = float(cfg.get('verifier_min_behavior_acc_delta', 1.0e-9))
+    max_rel_for_freeze = float(cfg.get('verifier_behavior_freeze_max_relative_change', 0.20))
+
+    enabled = bool(cfg.get('verifier_behavior_freeze_enabled', True))
+
+    is_frozen = (
+        enabled
+        and float(rel_change) <= max_rel_for_freeze
+        and loss_delta < min_loss_delta
+        and acc_delta <= min_acc_delta
+    )
+
+    details = {
+        'behavior_freeze_enabled': enabled,
+        'behavior_loss_delta': loss_delta,
+        'behavior_acc_delta': acc_delta,
+        'verifier_min_behavior_loss_delta': min_loss_delta,
+        'verifier_min_behavior_acc_delta': min_acc_delta,
+        'verifier_behavior_freeze_max_relative_change': max_rel_for_freeze,
+        'behavior_frozen': is_frozen,
+    }
+
+    return is_frozen, details
 
 def clone_state_dict(state_dict):
     cloned = OrderedDict()
@@ -404,12 +439,17 @@ def verify_and_commit_candidate_parent(
 
         rel_change = relative_model_change(prev_local_parameters, cand_local_parameters)
         cohort_rate = float(cand_federation.model_rate[verifier_user_id])
-
         approved = True
         reason = 'ok'
 
         # Allow larger honest movement during the first few rounds
         structure_checks_enabled = int(epoch) > int(cfg.get('verifier_structure_warmup_rounds', 2))
+
+        behavior_frozen, behavior_report = behavior_freeze_check(
+            prev_eval=prev_eval,
+            cand_eval=cand_eval,
+            rel_change=rel_change,
+        )
 
         if cand_eval['Local-Loss'] > prev_eval['Local-Loss'] + cfg['verifier_max_loss_increase']:
             approved = False
@@ -426,6 +466,10 @@ def verify_and_commit_candidate_parent(
         elif structure_checks_enabled and rel_change > cfg['verifier_max_relative_change']:
             approved = False
             reason = 'candidate too different from previous approved parent'
+
+        elif structure_checks_enabled and behavior_frozen:
+            approved = False
+            reason = 'candidate has parameter drift but frozen verifier behavior'
         report = {
             'user_id': int(verifier_user_id),
             'cohort_rate': cohort_rate,
@@ -437,6 +481,7 @@ def verify_and_commit_candidate_parent(
             'structure_checks_enabled': structure_checks_enabled,
             'verifier_min_relative_change': float(cfg['verifier_min_relative_change']),
             'verifier_max_relative_change': float(cfg['verifier_max_relative_change']),
+            **behavior_report,
         }
         verifier_reports.append(report)
 
@@ -454,6 +499,12 @@ def verify_and_commit_candidate_parent(
                     f'[COMMIT][Verifier {verifier_user_id}] structure_checks_enabled={structure_checks_enabled}',
                     f'[COMMIT][Verifier {verifier_user_id}] min_rel_change={cfg["verifier_min_relative_change"]:.6e}',
                     f'[COMMIT][Verifier {verifier_user_id}] max_rel_change={cfg["verifier_max_relative_change"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] behavior_loss_delta={behavior_report["behavior_loss_delta"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] behavior_acc_delta={behavior_report["behavior_acc_delta"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] behavior_frozen={behavior_report["behavior_frozen"]}',
+                    f'[COMMIT][Verifier {verifier_user_id}] min_behavior_loss_delta={behavior_report["verifier_min_behavior_loss_delta"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] min_behavior_acc_delta={behavior_report["verifier_min_behavior_acc_delta"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] behavior_freeze_max_rel={behavior_report["verifier_behavior_freeze_max_relative_change"]:.6e}',
                 ]
             }, 'train', mean=False) 
 
