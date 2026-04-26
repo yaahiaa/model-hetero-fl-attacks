@@ -51,10 +51,15 @@ cfg['file_output'] = "New_Tables/MNIST_Rolex_TEST"
 # -------------------------------------------------------------------------
 cfg.setdefault('validation_response', 'zero_change')
 cfg.setdefault('round_log_dir', os.path.join('output', 'round_log', 'prototype2'))
-cfg.setdefault('verifier_val_size', 2)
-cfg.setdefault('verifier_max_loss_increase', 0.35)
-cfg.setdefault('verifier_max_acc_drop', 0.20)
-cfg.setdefault('verifier_min_relative_change', 1.0e-6)
+cfg.setdefault('verifier_val_size', 32)
+cfg.setdefault('verifier_max_loss_increase', 0.05)
+cfg.setdefault('verifier_max_acc_drop', 0.02)
+# Lower bound: reject near-exact replay
+cfg.setdefault('verifier_min_relative_change', 1.0e-5)
+# Upper bound: reject candidates that move too far from the previous approved parent
+cfg.setdefault('verifier_max_relative_change', 0.03)
+# Warmup: do not apply structural drift bounds during the first few rounds
+cfg.setdefault('verifier_structure_warmup_rounds', 2)
 full_path = os.getcwd() + "/" + cfg['file_output']
 fp = open(full_path, 'w')
 fp.write("N Max_Pearson Max_PSNR Max_Recovered\n")
@@ -403,16 +408,24 @@ def verify_and_commit_candidate_parent(
         approved = True
         reason = 'ok'
 
+        # Allow larger honest movement during the first few rounds
+        structure_checks_enabled = int(epoch) > int(cfg.get('verifier_structure_warmup_rounds', 2))
+
         if cand_eval['Local-Loss'] > prev_eval['Local-Loss'] + cfg['verifier_max_loss_increase']:
             approved = False
             reason = 'validation loss increased too much'
+
         elif cand_eval['Local-Accuracy'] + cfg['verifier_max_acc_drop'] < prev_eval['Local-Accuracy']:
             approved = False
             reason = 'validation accuracy dropped too much'
-        elif rel_change < cfg['verifier_min_relative_change']:
+
+        elif structure_checks_enabled and rel_change < cfg['verifier_min_relative_change']:
             approved = False
             reason = 'candidate too similar to previous approved parent'
 
+        elif structure_checks_enabled and rel_change > cfg['verifier_max_relative_change']:
+            approved = False
+            reason = 'candidate too different from previous approved parent'
         report = {
             'user_id': int(verifier_user_id),
             'cohort_rate': cohort_rate,
@@ -421,6 +434,9 @@ def verify_and_commit_candidate_parent(
             'prev_eval': prev_eval,
             'cand_eval': cand_eval,
             'relative_change': rel_change,
+            'structure_checks_enabled': structure_checks_enabled,
+            'verifier_min_relative_change': float(cfg['verifier_min_relative_change']),
+            'verifier_max_relative_change': float(cfg['verifier_max_relative_change']),
         }
         verifier_reports.append(report)
 
@@ -435,8 +451,11 @@ def verify_and_commit_candidate_parent(
                     f'[COMMIT][Verifier {verifier_user_id}] prev_acc={prev_eval["Local-Accuracy"]:.6f}',
                     f'[COMMIT][Verifier {verifier_user_id}] cand_acc={cand_eval["Local-Accuracy"]:.6f}',
                     f'[COMMIT][Verifier {verifier_user_id}] rel_change={rel_change:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] structure_checks_enabled={structure_checks_enabled}',
+                    f'[COMMIT][Verifier {verifier_user_id}] min_rel_change={cfg["verifier_min_relative_change"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] max_rel_change={cfg["verifier_max_relative_change"]:.6e}',
                 ]
-            }, 'train', mean=False)
+            }, 'train', mean=False) 
 
     active_user_model_rates = {
         int(uid): float(federation.model_rate[uid]) for uid in user_idx
