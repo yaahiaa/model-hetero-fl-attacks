@@ -216,52 +216,50 @@ def train(model_history_block2, model_history_fcnn, fcnn_attack_cache, dataset, 
     img_list = None
     for m in range(num_active_users):
         lr = cfg['lr_map'][federation.model_rate[user_idx[m]]] # This line modifies the learning rate based on user. 
-        (trained_parameters, img_data) = copy.deepcopy(
-    local[m].train(local_parameters[m], lr, logger)
-    )
+        (trained_parameters, img_data) = copy.deepcopy(local[m].train(local_parameters[m], lr, logger))
 
-    img_list = copy.deepcopy(img_data)
-    img_list_by_user[int(user_idx[m])] = copy.deepcopy(img_data)
+        img_list = copy.deepcopy(img_data)
+        img_list_by_user[int(user_idx[m])] = copy.deepcopy(img_data)
 
-    if bool(cfg.get('local_dp_enabled', False)):
-        privatized_parameters, ldp_report = apply_local_dp_to_update(
-            base_parameters=distributed_local_parameters[m],
-            trained_parameters=trained_parameters,
-            clip_norm=float(cfg.get('ldp_clip_norm', 1.0)),
-            noise_multiplier=float(cfg.get('ldp_noise_multiplier', 0.05)),
-            enabled=True,
-        )
-        local_parameters[m] = privatized_parameters
+        if bool(cfg.get('local_dp_enabled', False)):
+            privatized_parameters, ldp_report = apply_local_dp_to_update(
+                base_parameters=distributed_local_parameters[m],
+                trained_parameters=trained_parameters,
+                clip_norm=float(cfg.get('ldp_clip_norm', 1.0)),
+                noise_multiplier=float(cfg.get('ldp_noise_multiplier', 0.05)),
+                enabled=True,
+            )
+            local_parameters[m] = privatized_parameters
 
-        if cfg.get('debug_local_dp', False):
-            logger.append({
-                'info': [
-                    f'[LDP] epoch={epoch}',
-                    f'[LDP] user_id={user_idx[m]}',
-                    f'[LDP] model_rate={federation.model_rate[user_idx[m]]}',
-                    f'[LDP] update_norm={ldp_report["ldp_update_norm"]:.6e}',
-                    f'[LDP] clip_factor={ldp_report["ldp_clip_factor"]:.6e}',
-                    f'[LDP] clip_norm={ldp_report["ldp_clip_norm"]:.6e}',
-                    f'[LDP] noise_multiplier={ldp_report["ldp_noise_multiplier"]:.6e}',
-                    f'[LDP] noise_std={ldp_report["ldp_noise_std"]:.6e}',
-                ]
-            }, 'train', mean=False)
-    else:
-        local_parameters[m] = trained_parameters
-        if m % int((num_active_users * cfg['log_interval']) + 1) == 0:
-            local_time = (time.time() - start_time) / (m + 1)
-            epoch_finished_time = datetime.timedelta(seconds=local_time * (num_active_users - m - 1))
-            exp_finished_time = epoch_finished_time + datetime.timedelta(
-                seconds=round((cfg['num_epochs']['global'] - epoch) * local_time * num_active_users))
-            info = {'info': ['Model: {}'.format(cfg['model_tag']), 
-                             'Train Epoch: {}({:.0f}%)'.format(epoch, 100. * m / num_active_users),
-                             'ID: {}({}/{})'.format(user_idx[m], m + 1, num_active_users),
-                             'Learning rate: {}'.format(lr),
-                             'Rate: {}'.format(federation.model_rate[user_idx[m]]),
-                             'Epoch Finished Time: {}'.format(epoch_finished_time),
-                             'Experiment Finished Time: {}'.format(exp_finished_time)]}
-            logger.append(info, 'train', mean=False)
-            logger.write('train', cfg['metric_name']['train']['Local'])   
+            if cfg.get('debug_local_dp', False):
+                logger.append({
+                    'info': [
+                        f'[LDP] epoch={epoch}',
+                        f'[LDP] user_id={user_idx[m]}',
+                        f'[LDP] model_rate={federation.model_rate[user_idx[m]]}',
+                        f'[LDP] update_norm={ldp_report["ldp_update_norm"]:.6e}',
+                        f'[LDP] clip_factor={ldp_report["ldp_clip_factor"]:.6e}',
+                        f'[LDP] clip_norm={ldp_report["ldp_clip_norm"]:.6e}',
+                        f'[LDP] noise_multiplier={ldp_report["ldp_noise_multiplier"]:.6e}',
+                        f'[LDP] noise_std={ldp_report["ldp_noise_std"]:.6e}',
+                    ]
+                }, 'train', mean=False)
+        else:
+            local_parameters[m] = trained_parameters
+            if m % int((num_active_users * cfg['log_interval']) + 1) == 0:
+                local_time = (time.time() - start_time) / (m + 1)
+                epoch_finished_time = datetime.timedelta(seconds=local_time * (num_active_users - m - 1))
+                exp_finished_time = epoch_finished_time + datetime.timedelta(
+                    seconds=round((cfg['num_epochs']['global'] - epoch) * local_time * num_active_users))
+                info = {'info': ['Model: {}'.format(cfg['model_tag']), 
+                                'Train Epoch: {}({:.0f}%)'.format(epoch, 100. * m / num_active_users),
+                                'ID: {}({}/{})'.format(user_idx[m], m + 1, num_active_users),
+                                'Learning rate: {}'.format(lr),
+                                'Rate: {}'.format(federation.model_rate[user_idx[m]]),
+                                'Epoch Finished Time: {}'.format(epoch_finished_time),
+                                'Experiment Finished Time: {}'.format(exp_finished_time)]}
+                logger.append(info, 'train', mean=False)
+                logger.write('train', cfg['metric_name']['train']['Local'])   
     
     federation.combine(local_parameters, param_idx, user_idx)
 
