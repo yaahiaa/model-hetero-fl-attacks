@@ -53,3 +53,19 @@ world_size: 1
 resume_mode: 0
 # other
 save_format: pdf
+
+# -------------------------------------------------------------------------
+# Prototype4: RMA replay flow
+# -------------------------------------------------------------------------
+attack_source_round: 3
+attack_replay_round: 4
+attack_replay_enabled: true
+debug_attack_replay: true
+
+# -------------------------------------------------------------------------
+# Prototype4: Local DP defense
+# -------------------------------------------------------------------------
+local_dp_enabled: false
+ldp_clip_norm: 1.0
+ldp_noise_multiplier: 0.05
+debug_local_dp: false
