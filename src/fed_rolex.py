@@ -4,12 +4,21 @@ import numpy as np
 from config import cfg
 from collections import OrderedDict
 
-
+def _clone_state_dict(state_dict):
+    cloned = OrderedDict()
+    for k, v in state_dict.items():
+        if torch.is_tensor(v):
+            cloned[k] = v.detach().clone()
+        else:
+            cloned[k] = copy.deepcopy(v)
+    return cloned
 
 class Federation:
     def __init__(self, epoch, global_parameters, rate, label_split):
         self.rd = epoch
         self.global_parameters = global_parameters
+        self.initial_parent_state = _clone_state_dict(global_parameters)
+        self.last_distribution_debug = []
         self.target_weights = ['blocks.2.weight']
         self.target_weights_fcnn = ['layers.0.weight']
         self.target_biases = ['blocks.0.bias', 'blocks.2.bias']
@@ -59,7 +68,9 @@ class Federation:
                                     output_idx_i_m = torch.arange(output_size, device=v.device)[:local_output_size]
 
                                 if k in self.target_weights_fcnn:
-                                    if self.model_rate[user_idx[m]] == 0.25 and self.rd == 2:
+                                    replay_round = int(cfg.get('attack_replay_round', 4))
+
+                                    if self.model_rate[user_idx[m]] == 0.25 and self.rd == replay_round:
                                         # Assign this client the malicious weights. 
                                         output_idx_i_m = (output_idx_i_m + int((self.model_rate[user_idx[m]]) * v.size()[0])) % v.size()[0]
                                         (output_idx_i_m, sorted_indeces) = torch.sort(output_idx_i_m)
@@ -222,64 +233,59 @@ class Federation:
             raise ValueError('Not valid model name')
         return idx
 
-    def distribute(self, user_idx):
-        self.make_model_rate()
-        param_idx = self.split_model(user_idx)
+    def _extract_from_param_idx(self, user_idx, param_idx):
         local_parameters = [OrderedDict() for _ in range(len(user_idx))]
+
         for k, v in self.global_parameters.items():
             parameter_type = k.split('.')[-1]
+
             for m in range(len(user_idx)):
                 if 'weight' in parameter_type or 'bias' in parameter_type:
                     if 'weight' in parameter_type:
                         if v.dim() > 1:
-                            local_parameters[m][k] = copy.deepcopy(v[torch.meshgrid(param_idx[m][k])])
+                            local_parameters[m][k] = copy.deepcopy(
+                                v[torch.meshgrid(param_idx[m][k])]
+                            )
                         else:
-                            local_parameters[m][k] = copy.deepcopy(v[param_idx[m][k]]) # Extracting the sub-parameters for a layer. 
+                            local_parameters[m][k] = copy.deepcopy(v[param_idx[m][k]])
                     else:
                         local_parameters[m][k] = copy.deepcopy(v[param_idx[m][k]])
-
-                    if self.model_rate[user_idx[m]] == 0.25:
-                        if k == 'layers.0.weight': # Need to do torch cat. 
-                            updated_size = (int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])), v.size()[1])
-                            self.initialize_weights(updated_size, k)
-                        elif k == 'layers.2.weight': # Need to do torch cat along other dimension. 
-                            updated_size = (v.size()[0], int(np.ceil(v.size()[1] * self.model_rate[user_idx[m]])))
-                            self.initialize_weights(updated_size, k)
-                        elif k == 'layers.0.bias': # Need to do torch cat. 
-                            self.initialize_biases(int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])), k)
-                            # local_parameters[m][k] = self.model_to_distribute[k]
-                        elif k == 'layers.2.bias': # No need for torch cat. 
-                            updated_size = v.size()[0]
-                            self.initialize_biases(updated_size, k)
-                        # In any case: 
-                        local_parameters[m][k] = self.model_to_distribute[k]
-                    else:
-                        # Instead of the same initialization, vary the initialization of weights for epochs 1 and 2. 
-                        # Use model_distributed + some small amount of uniform noise. 
-                        if self.rd == 1:
-                            local_parameters[m][k] = local_parameters[m][k].fill_(cfg['distribute_init_val']) 
-                        else:
-                            # self.rd == 2. 
-                            mean_val = torch.mean(torch.abs(v))
-                            # print("DISTRIBUTE: For epoch %s, mean_val = %s"%(self.rd, mean_val))
-                            # print("DISTRIBUTE: For epoch %s, noise_std = %s and cfg['distribute_init_val'] = %s"%(self.rd, cfg['noise_scale'] * mean_val, cfg['distribute_init_val']))
-                            if cfg['noise_scale'] is None:
-                                local_parameters[m][k] = local_parameters[m][k].fill_(cfg['distribute_init_val'])
-                            else:
-                                local_parameters[m][k] = local_parameters[m][k].uniform_(cfg['distribute_init_val'] - cfg['noise_scale'] * mean_val, cfg['distribute_init_val'] + cfg['noise_scale'] * mean_val)
-                    
-                    # local_parameters[m][k] = local_parameters[m][k].fill_(0.25)
-                    # local_parameters[m][k].uniform_(to=0.0010)
-                    # torch.nn.init.xavier_normal_(local_parameters[m][k], gain=0.5)
-                    # if (k in target_weights or k in target_biases):
-                    # local_parameters[m][k].normal_(mean=1, std=0.0002)
-
                 else:
                     local_parameters[m][k] = copy.deepcopy(v)
 
-                
-        # local_parameters: An array indexed by user_idx, which maps a key (e.g. blocks.weight.0 to its corresponding value (subset of global value))
-        # param_idx: What is returned from split model (i.e. the indeces of which parameters to keep for a given layer). 
+        return local_parameters
+
+
+    def extract_honest_local_parameters(self, user_idx, param_idx=None):
+        self.make_model_rate()
+        if param_idx is None:
+            param_idx = self.split_model(user_idx)
+
+        local_parameters = self._extract_from_param_idx(user_idx, param_idx)
+        return local_parameters, param_idx
+
+
+    def distribute(self, user_idx):
+        # Prototype4: no fake uniform tensors here.
+        # The attack is produced by replaying a real parent model across rounds,
+        # while the target cohort is shifted in attack_replay_round.
+        local_parameters, param_idx = self.extract_honest_local_parameters(user_idx)
+
+        self.last_distribution_debug = []
+        replay_round = int(cfg.get('attack_replay_round', 4))
+
+        for m, uid in enumerate(user_idx):
+            self.last_distribution_debug.append({
+                'round': int(self.rd),
+                'user_id': int(uid),
+                'model_rate': float(self.model_rate[uid]),
+                'target_shift_applied': bool(
+                    cfg['model_name'] == 'fcnn'
+                    and float(self.model_rate[uid]) == 0.25
+                    and int(self.rd) == replay_round
+                ),
+            })
+
         return local_parameters, param_idx
 
     def generate_pts(self, num_elements, down_scale_factor=0.95, mu=0.0, sigma=0.5):

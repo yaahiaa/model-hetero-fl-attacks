@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from torchvision import transforms
+from local_dp import apply_local_dp_to_update
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 cudnn.benchmark = True
@@ -43,10 +44,74 @@ cfg['local_train_size'] = 10
 cfg['noise_scale'] = None
 cfg['distribute_init_val'] = 0.25
 cfg['file_output'] = "New_Tables/MNIST_Rolex_TEST"
+
+# Prototype4: base RMA + local DP only
+cfg.setdefault('attack_source_round', 3)
+cfg.setdefault('attack_replay_round', 4)
+cfg.setdefault('attack_replay_enabled', True)
+cfg.setdefault('debug_attack_replay', False)
+# Local DP defense
+cfg.setdefault('local_dp_enabled', False)
+cfg.setdefault('ldp_clip_norm', 1.0)
+cfg.setdefault('ldp_noise_multiplier', 0.05)
+cfg.setdefault('debug_local_dp', False)
+
 full_path = os.getcwd() + "/" + cfg['file_output']
 fp = open(full_path, 'w')
 fp.write("N Max_Pearson Max_PSNR Max_Recovered\n")
 
+def clone_state_dict(state_dict):
+    cloned = OrderedDict()
+    for k, v in state_dict.items():
+        if torch.is_tensor(v):
+            cloned[k] = v.detach().clone()
+        else:
+            cloned[k] = copy.deepcopy(v)
+    return cloned
+
+
+def get_fcnn_shifted_block_contributor_counts(federation, user_idx, target_rate=0.25):
+    active_rates = [float(federation.model_rate[u]) for u in user_idx]
+
+    # Source round: shifted block is updated by cohorts larger than target.
+    # Replay round: shifted block is updated by larger cohorts + target cohort.
+    num_source_contributors = sum(1 for r in active_rates if r > target_rate)
+    num_replay_contributors = sum(1 for r in active_rates if r >= target_rate)
+
+    return num_source_contributors, num_replay_contributors
+
+
+def fcnn_leakage_from_cache(
+    *,
+    key,
+    model_rate,
+    distributed_model,
+    source_honest_parent,
+    replay_result_parent,
+    num_source_contributors,
+    num_replay_contributors,
+):
+   
+    if source_honest_parent is None or replay_result_parent is None:
+        return None
+
+    hidden_size = source_honest_parent.size(0)
+    client_cap = int(float(model_rate) * hidden_size)
+
+    lower = client_cap
+    upper = lower + client_cap
+
+    source_block = source_honest_parent[lower:upper].to(cfg['device'])
+    replay_block = replay_result_parent[lower:upper].to(cfg['device'])
+
+    # Undo averaging to isolate the target cohort's trained local model.
+    target_trained_model = (
+        replay_block * float(num_replay_contributors)
+        - source_block * float(num_source_contributors)
+    )
+
+    # The inversion code expects "distributed_model - trained_model".
+    return distributed_model.to(cfg['device']) - target_trained_model
 
 def main():
     process_control()
@@ -105,11 +170,15 @@ def runExperiment():
     model_history_fcnn['layers.0.weight'] = []
     model_history_fcnn['layers.0.bias'] = []
 
+    fcnn_attack_cache = {
+        'source_honest_parent': {},
+        'replay_result_parent': {},
+    }
 
     for epoch in range(last_epoch, cfg['num_epochs']['global'] + 1):
         logger.safe(True)
         federation = Federation(epoch, global_parameters, cfg['model_rate'], label_split)
-        train(model_history_block2, model_history_fcnn, dataset['train'], data_split['train'], label_split, federation, model, optimizer, logger, epoch)
+        train(model_history_block2, model_history_fcnn, fcnn_attack_cache, dataset['train'], data_split['train'], label_split, federation, model, optimizer, logger, epoch)
         test_model = stats(dataset['train'], model)
         test(dataset['test'], data_split['test'], label_split, test_model, logger, epoch)
         if cfg['scheduler_name'] == 'ReduceLROnPlateau':
@@ -132,10 +201,12 @@ def runExperiment():
     return
 
 
-def train(model_history_block2, model_history_fcnn, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch):
+def train(model_history_block2, model_history_fcnn, fcnn_attack_cache, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch):
     global_model.load_state_dict(federation.global_parameters)
     global_model.train(True)
     local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation)
+    distributed_local_parameters = copy.deepcopy(local_parameters)
+    img_list_by_user = {}
     num_active_users = len(local)
 
     lr = optimizer.param_groups[0]['lr']
@@ -145,8 +216,38 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
     img_list = None
     for m in range(num_active_users):
         lr = cfg['lr_map'][federation.model_rate[user_idx[m]]] # This line modifies the learning rate based on user. 
-        (local_parameters[m], img_data) = copy.deepcopy(local[m].train(local_parameters[m], lr, logger))
-        img_list = copy.deepcopy(img_data)
+        (trained_parameters, img_data) = copy.deepcopy(
+    local[m].train(local_parameters[m], lr, logger)
+    )
+
+    img_list = copy.deepcopy(img_data)
+    img_list_by_user[int(user_idx[m])] = copy.deepcopy(img_data)
+
+    if bool(cfg.get('local_dp_enabled', False)):
+        privatized_parameters, ldp_report = apply_local_dp_to_update(
+            base_parameters=distributed_local_parameters[m],
+            trained_parameters=trained_parameters,
+            clip_norm=float(cfg.get('ldp_clip_norm', 1.0)),
+            noise_multiplier=float(cfg.get('ldp_noise_multiplier', 0.05)),
+            enabled=True,
+        )
+        local_parameters[m] = privatized_parameters
+
+        if cfg.get('debug_local_dp', False):
+            logger.append({
+                'info': [
+                    f'[LDP] epoch={epoch}',
+                    f'[LDP] user_id={user_idx[m]}',
+                    f'[LDP] model_rate={federation.model_rate[user_idx[m]]}',
+                    f'[LDP] update_norm={ldp_report["ldp_update_norm"]:.6e}',
+                    f'[LDP] clip_factor={ldp_report["ldp_clip_factor"]:.6e}',
+                    f'[LDP] clip_norm={ldp_report["ldp_clip_norm"]:.6e}',
+                    f'[LDP] noise_multiplier={ldp_report["ldp_noise_multiplier"]:.6e}',
+                    f'[LDP] noise_std={ldp_report["ldp_noise_std"]:.6e}',
+                ]
+            }, 'train', mean=False)
+    else:
+        local_parameters[m] = trained_parameters
         if m % int((num_active_users * cfg['log_interval']) + 1) == 0:
             local_time = (time.time() - start_time) / (m + 1)
             epoch_finished_time = datetime.timedelta(seconds=local_time * (num_active_users - m - 1))
@@ -163,53 +264,130 @@ def train(model_history_block2, model_history_fcnn, dataset, data_split, label_s
             logger.write('train', cfg['metric_name']['train']['Local'])   
     
     federation.combine(local_parameters, param_idx, user_idx)
+
+    honest_aggregated_state = clone_state_dict(federation.global_parameters)
+
+    attack_source_round = int(cfg.get('attack_source_round', 3))
+    attack_replay_round = int(cfg.get('attack_replay_round', 4))
+
+    if cfg['model_name'] == 'fcnn' and epoch == attack_source_round:
+        for key in ['layers.0.weight', 'layers.0.bias']:
+            fcnn_attack_cache['source_honest_parent'][key] = honest_aggregated_state[key].detach().clone()
+
+        if bool(cfg.get('attack_replay_enabled', True)):
+            # This is the malicious server action:
+            # instead of using the honest aggregate from round 3 as parent for round 4,
+            # replay the real parent that was used at the start of round 3.
+            federation.global_parameters = clone_state_dict(federation.initial_parent_state)
+
+            if cfg.get('debug_attack_replay', False):
+                print(
+                    f'[REPLAY] epoch={epoch}: stored honest source aggregate, '
+                    f'but replayed previous real parent for epoch {epoch + 1}',
+                    flush=True,
+                )
+        else:
+            federation.global_parameters = honest_aggregated_state
+
+    else:
+        federation.global_parameters = honest_aggregated_state
+
     global_model.load_state_dict(federation.global_parameters)
-
-
     global_model_state_dict_copy = copy.deepcopy(global_model.state_dict())
+
+    if cfg['model_name'] == 'fcnn' and epoch == attack_replay_round:
+        for key in ['layers.0.weight', 'layers.0.bias']:
+            fcnn_attack_cache['replay_result_parent'][key] = honest_aggregated_state[key].detach().clone()
 
 
     # Append to the model history. 
     if cfg['model_name'] == 'fcnn':
         targetWeights = ['layers.0.weight']
         targetBiases = ['layers.0.bias']
+
+        attack_replay_round = int(cfg.get('attack_replay_round', 4))
+
         for m in range(num_active_users):
+            if federation.model_rate[user_idx[m]] != 0.25:
+                continue
+
             weight_grad = None
             bias_grad = None
-            max_pearson_overall = 0.0
-            max_psnr_overall = 0.0
             max_pearson_list = []
             max_psnr_list = []
             num_recovered_list = []
-            for k, v in global_model_state_dict_copy.items():
-                if federation.model_rate[user_idx[m]] == 0.25:
-                    if (k in targetWeights or k in targetBiases):
-                            model_history_fcnn[k].append(global_model_state_dict_copy[k])
-                            if (epoch == 2): 
-                                
-                                if k in targetWeights:
-                                    weight_grad = fcnn_leakage(k, user_idx[m], num_active_users, federation.model_rate[user_idx[m]], local_parameters[m][k], model_history_fcnn[k], federation.model_to_distribute[k])
-                                else:
-                                    bias_grad = fcnn_leakage(k, user_idx[m], num_active_users, federation.model_rate[user_idx[m]], local_parameters[m][k], model_history_fcnn[k], federation.model_to_distribute[k])
-                                
-                                # print("For epoch %s, weight_grad = %s and bias_grad = %s"%(epoch, weight_grad, bias_grad))
 
-                            # max_overall_avgs = []
-                            if (weight_grad is not None and bias_grad is not None):
-                                bias_grad_sum = torch.abs(torch.sum(bias_grad)).item()
-                                if bias_grad_sum != 0.0:
-                                    (max_pearson, max_psnr, num_recovered) = reconstruct_image(weight_grad, bias_grad, img_list)
-                                    max_pearson_overall = max(max_pearson_overall, max_pearson)
-                                    max_psnr_overall = max(max_psnr_overall, max_psnr)
-                                    max_pearson_list.append(max_pearson)
-                                    max_psnr_list.append(max_psnr)
-                                    num_recovered_list.append(num_recovered)
+            if epoch != attack_replay_round:
+                continue
+
+            for k in targetWeights + targetBiases:
+                distributed_model = distributed_local_parameters[m][k]
+
+                num_source_contributors, num_replay_contributors = (
+                    get_fcnn_shifted_block_contributor_counts(
+                        federation,
+                        user_idx,
+                        target_rate=0.25,
+                    )
+                )
+
+                recovered = fcnn_leakage_from_cache(
+                    key=k,
+                    model_rate=federation.model_rate[user_idx[m]],
+                    distributed_model=distributed_model,
+                    source_honest_parent=fcnn_attack_cache['source_honest_parent'].get(k, None),
+                    replay_result_parent=fcnn_attack_cache['replay_result_parent'].get(k, None),
+                    num_source_contributors=num_source_contributors,
+                    num_replay_contributors=num_replay_contributors,
+                )
+
+                if cfg.get('debug_attack_replay', False):
+                    print(
+                        f'[REPLAY][LEAKAGE] epoch={epoch} user={user_idx[m]} key={k} '
+                        f'src_count={num_source_contributors} '
+                        f'replay_count={num_replay_contributors} '
+                        f'have_source={fcnn_attack_cache["source_honest_parent"].get(k, None) is not None} '
+                        f'have_replay={fcnn_attack_cache["replay_result_parent"].get(k, None) is not None}',
+                        flush=True,
+                    )
+
+                if recovered is None:
+                    continue
+
+                if k in targetWeights:
+                    weight_grad = recovered
+                else:
+                    bias_grad = recovered
+
+            if weight_grad is not None and bias_grad is not None:
+                target_img_list = img_list_by_user.get(int(user_idx[m]), None)
+
+                if target_img_list is not None and len(target_img_list) > 0:
+                    max_pearson, max_psnr, num_recovered = reconstruct_image(
+                        weight_grad,
+                        bias_grad,
+                        target_img_list,
+                    )
+
+                    max_pearson_list.append(max_pearson)
+                    max_psnr_list.append(max_psnr)
+                    num_recovered_list.append(num_recovered)
+                else:
+                    print(
+                        f'RECONSTRUCT: skipped because no image batch was recorded '
+                        f'for target user {user_idx[m]}',
+                        flush=True,
+                    )
+
             if len(max_pearson_list) > 0:
-                N_Table = cfg['local_train_size']
-                Max_Pearson_Table = max(max_pearson_list)
-                Max_PSNR_Table = max(max_psnr_list)
-                Max_Recovered_Table = max(num_recovered_list)
-                fp.write("%s %s %s %s\n"%(N_Table, Max_Pearson_Table, Max_PSNR_Table, Max_Recovered_Table))
+                fp.write(
+                    "%s %s %s %s\n" % (
+                        cfg['local_train_size'],
+                        max(max_pearson_list),
+                        max(max_psnr_list),
+                        max(num_recovered_list),
+                    )
+                )
 
 
     if cfg['model_name'] == 'conv':
@@ -258,7 +436,13 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
         best_partial_recon = None
 
         for i in range(weight_grad.size()[0]):
-            partial_recon = torch.divide(weight_grad[i], bias_grad[i])
+            denom = bias_grad[i]
+            eps = 1.0e-8
+
+            if torch.abs(denom).item() < eps:
+                continue
+
+            partial_recon = torch.divide(weight_grad[i], denom)
 
             img_reshaped = elem_extracted.reshape(partial_recon.size())
 
@@ -298,6 +482,9 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
         # fig_save_str = "New_Images/reconstructedConvRate_%s"%(count)
         # plt.savefig(fig_save_str)
 
+    if len(avg_pearson) == 0:
+        print("RECONSTRUCT: no valid partial reconstructions", flush=True)
+        return (0.0, 0.0, 0)
     print("RECONSTRUCT: best_ssim across images = %s"%(max(avg_ssim)))
     print("RECONSTRUCT: best_psnr across images = %s"%(max(avg_psnr)))
     print("RECONSTRUCT: best_pearson across images = %s"%(max(avg_pearson)))
