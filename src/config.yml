@@ -60,7 +60,7 @@ validation_response: zero_change
 verifier_val_size : 32
 verifier_max_loss_increase : 0.05
 verifier_max_acc_drop : 0.02
-verifier_min_relative_change : 1e-5
+verifier_min_relative_change : 1.0e-5
 verifier_max_relative_change : 0.03
 verifier_structure_warmup_rounds : 2
 
