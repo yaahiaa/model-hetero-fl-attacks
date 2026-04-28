@@ -22,9 +22,11 @@ from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from torchvision import transforms
 from local_dp import apply_local_dp_to_update
+from distributed_dp import apply_distributed_dp_to_update
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 cudnn.benchmark = True
+RAW_DP_MODE_PRESENT = 'dp_mode' in cfg
 parser = argparse.ArgumentParser(description='cfg')
 for k in cfg:
     exec('parser.add_argument(\'--{0}\', default=cfg[\'{0}\'], type=type(cfg[\'{0}\']))'.format(k))
@@ -45,18 +47,26 @@ cfg['noise_scale'] = None
 cfg['distribute_init_val'] = 0.25
 cfg['file_output'] = "New_Tables/MNIST_Rolex_TEST"
 
-# Prototype4: base RMA + local DP only
+# Prototype4: base RMA with configurable DP defense
 cfg.setdefault('attack_source_round', 3)
 cfg.setdefault('attack_replay_round', 4)
 cfg.setdefault('attack_replay_enabled', True)
 cfg.setdefault('attack_model_mode', 'real_replay')
 cfg.setdefault('debug_attack_replay', False)
 cfg.setdefault('debug_hybrid_trap', False)
+# DP defense mode
+cfg.setdefault('dp_mode', 'none')
 # Local DP defense
 cfg.setdefault('local_dp_enabled', False)
 cfg.setdefault('ldp_clip_norm', 1.0)
-cfg.setdefault('ldp_noise_multiplier', 0.05)
+cfg.setdefault('ldp_noise_multiplier', 0.005)
 cfg.setdefault('debug_local_dp', False)
+# Distributed DP defense
+cfg.setdefault('ddp_enabled', False)
+cfg.setdefault('ddp_clip_norm', 1.0)
+cfg.setdefault('ddp_noise_multiplier', 0.005)
+cfg.setdefault('ddp_debug', False)
+cfg.setdefault('ddp_use_shared_total_noise', False)
 
 full_path = os.getcwd() + "/" + cfg['file_output']
 fp = open(full_path, 'w')
@@ -70,6 +80,27 @@ def clone_state_dict(state_dict):
         else:
             cloned[k] = copy.deepcopy(v)
     return cloned
+
+
+def get_dp_mode():
+    mode = str(cfg.get('dp_mode', 'none')).lower()
+    if mode == 'distributed':
+        return 'distributed'
+    if mode == 'local':
+        return 'local'
+    if mode == 'none':
+        if RAW_DP_MODE_PRESENT:
+            return 'none'
+        if bool(cfg.get('ddp_enabled', False)):
+            return 'distributed'
+        if bool(cfg.get('local_dp_enabled', False)):
+            return 'local'
+        return 'none'
+    if bool(cfg.get('ddp_enabled', False)):
+        return 'distributed'
+    if bool(cfg.get('local_dp_enabled', False)):
+        return 'local'
+    raise ValueError(f'Invalid dp_mode: {cfg.get("dp_mode")}')
 
 
 def get_fcnn_shifted_block_contributor_counts(federation, user_idx, target_rate=0.25):
@@ -210,10 +241,37 @@ def train(model_history_block2, model_history_fcnn, fcnn_attack_cache, dataset, 
     distributed_local_parameters = copy.deepcopy(local_parameters)
     img_list_by_user = {}
     num_active_users = len(local)
+    dp_mode = get_dp_mode()
 
     lr = optimizer.param_groups[0]['lr']
 
     start_time = time.time()
+
+    logger.append({
+        'info': [
+            f'[DP] epoch={epoch}',
+            f'[DP] mode={dp_mode}',
+            f'[DP] num_active_users={num_active_users}',
+        ]
+    }, 'train', mean=False)
+
+    if dp_mode == 'distributed' and cfg.get('ddp_debug', False):
+        sigma_total = float(cfg.get('ddp_noise_multiplier', 0.005)) * float(cfg.get('ddp_clip_norm', 1.0))
+        sigma_client = np.sqrt(num_active_users) * sigma_total
+        logger.append({
+            'info': [
+                f'[DDP] epoch={epoch}',
+                f'[DDP] expected aggregate noise std = {sigma_total:.6e} because each of {num_active_users} clients adds sigma_client={sigma_client:.6e} and server averages {num_active_users} clients',
+                '[DDP] this is a simulation of distributed client-contributed Gaussian noise, not a secure distributed-DP protocol',
+            ]
+        }, 'train', mean=False)
+        if bool(cfg.get('ddp_use_shared_total_noise', False)):
+            logger.append({
+                'info': [
+                    f'[DDP] epoch={epoch}',
+                    '[DDP] ddp_use_shared_total_noise is a reserved compatibility flag in this simulation; sigma_client still uses sqrt(k) * sigma_total',
+                ]
+            }, 'train', mean=False)
 
     img_list = None
     for m in range(num_active_users):
@@ -223,12 +281,39 @@ def train(model_history_block2, model_history_fcnn, fcnn_attack_cache, dataset, 
         img_list = copy.deepcopy(img_data)
         img_list_by_user[int(user_idx[m])] = copy.deepcopy(img_data)
 
-        if bool(cfg.get('local_dp_enabled', False)):
+        if dp_mode == 'distributed':
+            privatized_parameters, ddp_report = apply_distributed_dp_to_update(
+                base_parameters=distributed_local_parameters[m],
+                trained_parameters=trained_parameters,
+                clip_norm=float(cfg.get('ddp_clip_norm', 1.0)),
+                noise_multiplier=float(cfg.get('ddp_noise_multiplier', 0.005)),
+                num_active_users=num_active_users,
+                enabled=True,
+            )
+            local_parameters[m] = privatized_parameters
+
+            if cfg.get('ddp_debug', False):
+                logger.append({
+                    'info': [
+                        f'[DDP] epoch={epoch}',
+                        f'[DDP] user_id={user_idx[m]}',
+                        f'[DDP] model_rate={federation.model_rate[user_idx[m]]}',
+                        f'[DDP] num_active_users={ddp_report["ddp_num_active_users"]}',
+                        f'[DDP] update_norm_before_clip={ddp_report["ddp_update_norm"]:.6e}',
+                        f'[DDP] clip_factor={ddp_report["ddp_clip_factor"]:.6e}',
+                        f'[DDP] clip_norm={ddp_report["ddp_clip_norm"]:.6e}',
+                        f'[DDP] noise_multiplier={ddp_report["ddp_noise_multiplier"]:.6e}',
+                        f'[DDP] sigma_total={ddp_report["ddp_sigma_total"]:.6e}',
+                        f'[DDP] sigma_client={ddp_report["ddp_sigma_client"]:.6e}',
+                    ]
+                }, 'train', mean=False)
+
+        elif dp_mode == 'local':
             privatized_parameters, ldp_report = apply_local_dp_to_update(
                 base_parameters=distributed_local_parameters[m],
                 trained_parameters=trained_parameters,
                 clip_norm=float(cfg.get('ldp_clip_norm', 1.0)),
-                noise_multiplier=float(cfg.get('ldp_noise_multiplier', 0.05)),
+                noise_multiplier=float(cfg.get('ldp_noise_multiplier', 0.005)),
                 enabled=True,
             )
             local_parameters[m] = privatized_parameters
@@ -248,20 +333,22 @@ def train(model_history_block2, model_history_fcnn, fcnn_attack_cache, dataset, 
                 }, 'train', mean=False)
         else:
             local_parameters[m] = trained_parameters
-            if m % int((num_active_users * cfg['log_interval']) + 1) == 0:
-                local_time = (time.time() - start_time) / (m + 1)
-                epoch_finished_time = datetime.timedelta(seconds=local_time * (num_active_users - m - 1))
-                exp_finished_time = epoch_finished_time + datetime.timedelta(
-                    seconds=round((cfg['num_epochs']['global'] - epoch) * local_time * num_active_users))
-                info = {'info': ['Model: {}'.format(cfg['model_tag']), 
-                                'Train Epoch: {}({:.0f}%)'.format(epoch, 100. * m / num_active_users),
-                                'ID: {}({}/{})'.format(user_idx[m], m + 1, num_active_users),
-                                'Learning rate: {}'.format(lr),
-                                'Rate: {}'.format(federation.model_rate[user_idx[m]]),
-                                'Epoch Finished Time: {}'.format(epoch_finished_time),
-                                'Experiment Finished Time: {}'.format(exp_finished_time)]}
-                logger.append(info, 'train', mean=False)
-                logger.write('train', cfg['metric_name']['train']['Local'])   
+
+        if m % int((num_active_users * cfg['log_interval']) + 1) == 0:
+            local_time = (time.time() - start_time) / (m + 1)
+            epoch_finished_time = datetime.timedelta(seconds=local_time * (num_active_users - m - 1))
+            exp_finished_time = epoch_finished_time + datetime.timedelta(
+                seconds=round((cfg['num_epochs']['global'] - epoch) * local_time * num_active_users))
+            info = {'info': ['Model: {}'.format(cfg['model_tag']), 
+                            'Train Epoch: {}({:.0f}%)'.format(epoch, 100. * m / num_active_users),
+                            'ID: {}({}/{})'.format(user_idx[m], m + 1, num_active_users),
+                            'Learning rate: {}'.format(lr),
+                            'Rate: {}'.format(federation.model_rate[user_idx[m]]),
+                            'DP Mode: {}'.format(dp_mode),
+                            'Epoch Finished Time: {}'.format(epoch_finished_time),
+                            'Experiment Finished Time: {}'.format(exp_finished_time)]}
+            logger.append(info, 'train', mean=False)
+            logger.write('train', cfg['metric_name']['train']['Local'])   
     
     federation.combine(local_parameters, param_idx, user_idx)
 
