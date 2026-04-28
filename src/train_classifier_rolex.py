@@ -49,7 +49,9 @@ cfg['file_output'] = "New_Tables/MNIST_Rolex_TEST"
 cfg.setdefault('attack_source_round', 3)
 cfg.setdefault('attack_replay_round', 4)
 cfg.setdefault('attack_replay_enabled', True)
+cfg.setdefault('attack_model_mode', 'real_replay')
 cfg.setdefault('debug_attack_replay', False)
+cfg.setdefault('debug_hybrid_trap', False)
 # Local DP defense
 cfg.setdefault('local_dp_enabled', False)
 cfg.setdefault('ldp_clip_norm', 1.0)
@@ -358,6 +360,26 @@ def train(model_history_block2, model_history_fcnn, fcnn_attack_cache, dataset, 
                     bias_grad = recovered
 
             if weight_grad is not None and bias_grad is not None:
+                if cfg.get('debug_hybrid_trap', False):
+                    bias_grad_abs = torch.abs(bias_grad.detach().float())
+                    bias_grad_abs_min = float(torch.min(bias_grad_abs).item()) if bias_grad_abs.numel() > 0 else 0.0
+                    bias_grad_abs_max = float(torch.max(bias_grad_abs).item()) if bias_grad_abs.numel() > 0 else 0.0
+                    bias_grad_nonzero = int(torch.count_nonzero(bias_grad.detach()).item())
+                    weight_grad_norm = float(torch.norm(weight_grad.detach().float(), p=2).item())
+                    bias_grad_norm = float(torch.norm(bias_grad.detach().float(), p=2).item())
+
+                    logger.append({
+                        'info': [
+                            f'[HYBRID_TRAP][RECON] epoch={epoch}',
+                            f'[HYBRID_TRAP][RECON] user_id={int(user_idx[m])}',
+                            f'[HYBRID_TRAP][RECON] bias_grad_abs_min={bias_grad_abs_min:.6e}',
+                            f'[HYBRID_TRAP][RECON] bias_grad_abs_max={bias_grad_abs_max:.6e}',
+                            f'[HYBRID_TRAP][RECON] bias_grad_nonzero_count={bias_grad_nonzero}',
+                            f'[HYBRID_TRAP][RECON] weight_grad_norm={weight_grad_norm:.6e}',
+                            f'[HYBRID_TRAP][RECON] bias_grad_norm={bias_grad_norm:.6e}',
+                        ]
+                    }, 'train', mean=False)
+
                 target_img_list = img_list_by_user.get(int(user_idx[m]), None)
 
                 if target_img_list is not None and len(target_img_list) > 0:

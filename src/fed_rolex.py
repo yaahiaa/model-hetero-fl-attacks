@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import torch
 import numpy as np
 from config import cfg
@@ -26,6 +27,7 @@ class Federation:
         self.rate = rate
         self.label_split = label_split
         self.model_to_distribute = OrderedDict()
+        self.hybrid_trap_cache = {}
 
         self.make_model_rate()
 
@@ -264,26 +266,162 @@ class Federation:
         local_parameters = self._extract_from_param_idx(user_idx, param_idx)
         return local_parameters, param_idx
 
+    def _hybrid_trap_enabled_for_round(self):
+        if not bool(cfg.get('attack_replay_enabled', True)):
+            return False
+        if cfg.get('attack_model_mode', 'real_replay') != 'hybrid_trap':
+            return False
+        if cfg['model_name'] != 'fcnn':
+            return False
+        attack_source_round = int(cfg.get('attack_source_round', 3))
+        attack_replay_round = int(cfg.get('attack_replay_round', 4))
+        return int(self.rd) in (attack_source_round, attack_replay_round)
+
+    def _get_fcnn_attack_block_bounds(self, target_rate=0.25):
+        weight = self.global_parameters.get('layers.0.weight', None)
+        if weight is None:
+            return None
+
+        hidden_layer_size = int(weight.size(0))
+        client_cap = int(float(target_rate) * hidden_layer_size)
+        block_start = client_cap
+        block_end = min(block_start + client_cap, hidden_layer_size)
+
+        if client_cap <= 0 or block_start >= block_end:
+            return None
+
+        return client_cap, block_start, block_end
+
+    def _generate_pts_with_rng(self, rng, num_elements, down_scale_factor=0.95, mu=0.0, sigma=0.5):
+        vector = rng.normal(mu, sigma, num_elements)
+        abs_vector = abs(vector) * (-1)
+        num_pos = np.floor(num_elements / 2).astype(int)
+        pos_indices = rng.choice(num_elements, num_pos, replace=False)
+        negative_elements = np.delete(abs_vector, pos_indices)
+        abs_vector[pos_indices] = -down_scale_factor * negative_elements
+        return abs_vector
+
+    def _get_hybrid_trap_block_tensor(self, key, template_tensor, block_start, block_end):
+        cache_key = (key, int(block_start), int(block_end), tuple(template_tensor.shape), str(template_tensor.dtype))
+        if cache_key in self.hybrid_trap_cache:
+            return self.hybrid_trap_cache[cache_key]
+
+        block_size = int(block_end - block_start)
+        seed_material = '{}:{}:{}:{}'.format(
+            cfg.get('model_tag', cfg.get('init_seed', 0)),
+            key,
+            int(block_start),
+            int(block_end),
+        )
+        seed_bytes = hashlib.sha256(seed_material.encode('utf-8')).digest()[:4]
+        rng = np.random.RandomState(int.from_bytes(seed_bytes, byteorder='little', signed=False))
+
+        if template_tensor.dim() > 1:
+            trap_np = np.zeros((block_size, template_tensor.size(1)), dtype=np.float32)
+            for i in range(template_tensor.size(1)):
+                trap_np[:, i] = self._generate_pts_with_rng(
+                    rng, block_size, down_scale_factor=0.95, mu=0.0, sigma=0.5
+                )
+        else:
+            trap_np = self._generate_pts_with_rng(
+                rng, block_size, down_scale_factor=0.95, mu=0.0, sigma=0.5
+            ).astype(np.float32)
+
+        trap_tensor = torch.from_numpy(trap_np).to(device=template_tensor.device, dtype=template_tensor.dtype)
+        self.hybrid_trap_cache[cache_key] = trap_tensor
+        return trap_tensor
+
+    def _apply_hybrid_trap_overrides(self, local_parameters, param_idx, user_idx):
+        bounds = self._get_fcnn_attack_block_bounds(target_rate=0.25)
+        if bounds is None:
+            return []
+
+        _, block_start, block_end = bounds
+        trap_events = []
+
+        for m, uid in enumerate(user_idx):
+            for key in ['layers.0.weight', 'layers.0.bias']:
+                if key not in local_parameters[m] or key not in param_idx[m]:
+                    continue
+
+                if key == 'layers.0.weight':
+                    output_idx = param_idx[m][key][0]
+                else:
+                    output_idx = param_idx[m][key]
+
+                local_row_mask = (output_idx >= block_start) & (output_idx < block_end)
+                if not bool(torch.any(local_row_mask).item()):
+                    continue
+
+                local_row_idx = torch.nonzero(local_row_mask, as_tuple=False).flatten().long()
+                trap_row_idx = (output_idx[local_row_mask] - block_start).long()
+                local_tensor = local_parameters[m][key].detach().clone()
+                trap_block = self._get_hybrid_trap_block_tensor(
+                    key,
+                    self.global_parameters[key],
+                    block_start,
+                    block_end,
+                )
+
+                local_tensor[local_row_idx] = trap_block[trap_row_idx].to(
+                    device=local_tensor.device,
+                    dtype=local_tensor.dtype,
+                )
+                local_parameters[m][key] = local_tensor
+
+                trap_event = {
+                    'round': int(self.rd),
+                    'user_id': int(uid),
+                    'model_rate': float(self.model_rate[uid]),
+                    'key': key,
+                    'block_start': int(block_start),
+                    'block_end': int(block_end),
+                }
+                trap_events.append(trap_event)
+
+                if cfg.get('debug_hybrid_trap', False):
+                    print(f'[HYBRID_TRAP] round={trap_event["round"]}', flush=True)
+                    print(f'[HYBRID_TRAP] user_id={trap_event["user_id"]}', flush=True)
+                    print(f'[HYBRID_TRAP] model_rate={trap_event["model_rate"]}', flush=True)
+                    print(f'[HYBRID_TRAP] key={trap_event["key"]}', flush=True)
+                    print(f'[HYBRID_TRAP] block_start={trap_event["block_start"]}', flush=True)
+                    print(f'[HYBRID_TRAP] block_end={trap_event["block_end"]}', flush=True)
+
+        return trap_events
+
 
     def distribute(self, user_idx):
         # Prototype4: no fake uniform tensors here.
         # The attack is produced by replaying a real parent model across rounds,
         # while the target cohort is shifted in attack_replay_round.
+        # hybrid_trap optionally overrides only the attacked FCNN first-layer block.
         local_parameters, param_idx = self.extract_honest_local_parameters(user_idx)
+        hybrid_trap_events = []
+
+        if self._hybrid_trap_enabled_for_round():
+            hybrid_trap_events = self._apply_hybrid_trap_overrides(local_parameters, param_idx, user_idx)
 
         self.last_distribution_debug = []
         replay_round = int(cfg.get('attack_replay_round', 4))
+        hybrid_trap_events_by_user = {}
+        for event in hybrid_trap_events:
+            hybrid_trap_events_by_user.setdefault(event['user_id'], []).append(event)
 
         for m, uid in enumerate(user_idx):
             self.last_distribution_debug.append({
                 'round': int(self.rd),
                 'user_id': int(uid),
                 'model_rate': float(self.model_rate[uid]),
+                'attack_model_mode': cfg.get('attack_model_mode', 'real_replay'),
                 'target_shift_applied': bool(
                     cfg['model_name'] == 'fcnn'
                     and float(self.model_rate[uid]) == 0.25
                     and int(self.rd) == replay_round
                 ),
+                'hybrid_trap_applied': int(uid) in hybrid_trap_events_by_user,
+                'hybrid_trap_keys': [
+                    event['key'] for event in hybrid_trap_events_by_user.get(int(uid), [])
+                ],
             })
 
         return local_parameters, param_idx

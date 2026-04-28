@@ -60,7 +60,12 @@ save_format: pdf
 attack_source_round: 3
 attack_replay_round: 4
 attack_replay_enabled: true
+attack_model_mode: hybrid_trap
+# options:
+#   real_replay
+#   hybrid_trap
 debug_attack_replay: true
+debug_hybrid_trap: true
 
 # -------------------------------------------------------------------------
 # Prototype4: Local DP defense
