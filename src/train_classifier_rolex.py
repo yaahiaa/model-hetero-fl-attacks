@@ -66,6 +66,8 @@ cfg.setdefault('verifier_min_behavior_loss_delta', 0.005)
 cfg.setdefault('verifier_min_behavior_acc_delta', 1.0e-9)
 # Only apply the freeze detector in the low/mid drift region.
 cfg.setdefault('verifier_behavior_freeze_max_relative_change', 0.20)
+cfg.setdefault('attack_model_mode', 'hybrid_trap')
+cfg.setdefault('debug_hybrid_trap', True)
 full_path = os.getcwd() + "/" + cfg['file_output']
 fp = open(full_path, 'w')
 fp.write("N Max_Pearson Max_PSNR Max_Recovered\n")
@@ -756,6 +758,15 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
             ]
         }, 'train', mean=False)
 
+        if cfg.get('debug_hybrid_trap', False) and cfg.get('attack_model_mode', 'real_replay') == 'hybrid_trap':
+            logger.append({
+                'info': [
+                    f'[HYBRID_TRAP][COMMIT_REJECTED] epoch={epoch}',
+                    f'[HYBRID_TRAP][COMMIT_REJECTED] commitment_id={commitment_event["commitment_id"]}',
+                    f'[HYBRID_TRAP][COMMIT_REJECTED] rejection_response={rejection_response}',
+                ]
+            }, 'train', mean=False)
+
         if rejection_response == 'abort':
             raise RuntimeError(
                 f'Candidate parent rejected for round {epoch + 1}: {commitment_event["commitment_id"]}'
@@ -909,6 +920,26 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
                             bias_grad = recovered
 
             if weight_grad is not None and bias_grad is not None:
+                if cfg.get('debug_hybrid_trap', False):
+                    bias_grad_abs = torch.abs(bias_grad.detach().float())
+                    bias_grad_abs_min = float(torch.min(bias_grad_abs).item()) if bias_grad_abs.numel() > 0 else 0.0
+                    bias_grad_abs_max = float(torch.max(bias_grad_abs).item()) if bias_grad_abs.numel() > 0 else 0.0
+                    bias_grad_nonzero = int(torch.count_nonzero(bias_grad.detach()).item())
+                    weight_grad_norm = float(torch.norm(weight_grad.detach().float(), p=2).item())
+                    bias_grad_norm = float(torch.norm(bias_grad.detach().float(), p=2).item())
+
+                    logger.append({
+                        'info': [
+                            f'[HYBRID_TRAP][RECON] epoch={epoch}',
+                            f'[HYBRID_TRAP][RECON] user_id={int(user_idx[m])}',
+                            f'[HYBRID_TRAP][RECON] bias_grad_abs_min={bias_grad_abs_min:.6e}',
+                            f'[HYBRID_TRAP][RECON] bias_grad_abs_max={bias_grad_abs_max:.6e}',
+                            f'[HYBRID_TRAP][RECON] bias_grad_nonzero_count={bias_grad_nonzero}',
+                            f'[HYBRID_TRAP][RECON] weight_grad_norm={weight_grad_norm:.6e}',
+                            f'[HYBRID_TRAP][RECON] bias_grad_norm={bias_grad_norm:.6e}',
+                        ]
+                    }, 'train', mean=False)
+
                 bias_grad_sum = torch.abs(torch.sum(bias_grad)).item()
 
                 if bias_grad_sum != 0.0:

@@ -69,6 +69,11 @@ attack_commit_enabled: true
 attack_source_round: 3
 attack_replay_round: 4
 attack_commit_noise_scale: 0.0
+attack_model_mode: hybrid_trap
+# options:
+#   real_replay
+#   hybrid_trap
+debug_hybrid_trap: true
 
 # what to do if the replay candidate is rejected
 # options: rollback_previous, fallback_honest, abort
