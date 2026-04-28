@@ -70,7 +70,7 @@ debug_hybrid_trap: true
 # -------------------------------------------------------------------------
 # DP defense mode
 # -------------------------------------------------------------------------
-dp_mode: none
+dp_mode: distributed
 # options: none, local, distributed
 
 # Local DP, legacy/local baseline
@@ -83,8 +83,8 @@ debug_local_dp: false
 # Each client clips its local update and adds a noise share.
 # If k clients are active, sigma_client = sqrt(k) * sigma_total,
 # where sigma_total = ddp_noise_multiplier * ddp_clip_norm.
-ddp_enabled: false
+ddp_enabled: true
 ddp_clip_norm: 1.0
 ddp_noise_multiplier: 0.005
-ddp_debug: false
-ddp_use_shared_total_noise: false
+ddp_debug: true
+ddp_use_shared_total_noise: true
