@@ -1,7 +1,9 @@
 import argparse
+import csv
 import copy
 import datetime
 import hashlib
+import json
 import models
 import numpy as np
 import os
@@ -15,7 +17,17 @@ from config import cfg
 from data import fetch_dataset, make_data_loader, split_dataset, SplitDataset
 from fed_rolex import Federation
 from metrics import Metric
-from utils import save, to_device, process_control, process_dataset, make_optimizer, make_scheduler, resume, collate
+from utils import (
+    save,
+    to_device,
+    process_control,
+    process_dataset,
+    make_optimizer,
+    make_scheduler,
+    resume,
+    collate,
+    makedir_exist_ok,
+)
 from logger import Logger
 from collections import OrderedDict
 import matplotlib.pyplot as plt
@@ -27,10 +39,42 @@ from round_log import TransparencyLog, hash_state_dict
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 cudnn.benchmark = True
+
+
+def str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in {'1', 'true', 't', 'yes', 'y', 'on'}:
+        return True
+    if value in {'0', 'false', 'f', 'no', 'n', 'off'}:
+        return False
+    raise argparse.ArgumentTypeError('Expected a boolean value')
+
+
 parser = argparse.ArgumentParser(description='cfg')
 for k in cfg:
     exec('parser.add_argument(\'--{0}\', default=cfg[\'{0}\'], type=type(cfg[\'{0}\']))'.format(k))
 parser.add_argument('--control_name', default=None, type=str)
+parser.add_argument('--seed', default=None, type=int)
+parser.add_argument('--global_epochs', default=None, type=int)
+parser.add_argument('--local_epochs', default=None, type=int)
+parser.add_argument('--local_train_size', default=None, type=int)
+parser.add_argument('--train_batch_size', default=None, type=int)
+parser.add_argument('--test_batch_size', default=None, type=int)
+parser.add_argument('--experiment_method', default=None, type=str)
+parser.add_argument('--experiment_id', default=None, type=str)
+parser.add_argument('--results_dir', default=None, type=str)
+parser.add_argument('--leakage_results_csv', default=None, type=str)
+parser.add_argument('--epoch_results_csv', default=None, type=str)
+parser.add_argument('--overhead_results_csv', default=None, type=str)
+parser.add_argument('--enable_experiment_logging', default=None, type=str_to_bool)
+parser.add_argument('--attack_noise_amount', default=None, type=float)
+parser.add_argument('--noise_scale', default=None, type=float)
+parser.add_argument('--attack_blocked_zero_metrics', default=None, type=str_to_bool)
+parser.add_argument('--recovered_pearson_threshold', default=None, type=float)
+parser.add_argument('--convergence_mode', default=None, type=str_to_bool)
+parser.add_argument('--disable_attack_for_convergence', default=None, type=str_to_bool)
 args = vars(parser.parse_args())
 for k in cfg:
     cfg[k] = args[k]
@@ -42,8 +86,8 @@ cfg['pivot_metric'] = 'Global-Accuracy'
 cfg['pivot'] = -float('inf')
 cfg['metric_name'] = {'train': {'Local': ['Local-Loss', 'Local-Accuracy']},
                       'test': {'Local': ['Local-Loss', 'Local-Accuracy'], 'Global': ['Global-Loss', 'Global-Accuracy']}}
-cfg['local_train_size'] = 10
-cfg['noise_scale'] = None
+cfg['local_train_size'] = 10 if args['local_train_size'] is None else int(args['local_train_size'])
+cfg['noise_scale'] = args['noise_scale']
 cfg['distribute_init_val'] = 0.25
 cfg['file_output'] = "New_Tables/MNIST_Rolex_TEST"
 # -------------------------------------------------------------------------
@@ -68,9 +112,230 @@ cfg.setdefault('verifier_min_behavior_acc_delta', 1.0e-9)
 cfg.setdefault('verifier_behavior_freeze_max_relative_change', 0.20)
 cfg.setdefault('attack_model_mode', 'hybrid_trap')
 cfg.setdefault('debug_hybrid_trap', True)
+cfg.setdefault('experiment_method', 'committee')
+cfg.setdefault('experiment_id', None)
+cfg.setdefault('results_dir', 'results')
+cfg.setdefault('leakage_results_csv', '{results_dir}/leakage_raw.csv')
+cfg.setdefault('epoch_results_csv', '{results_dir}/epoch_raw.csv')
+cfg.setdefault('overhead_results_csv', '{results_dir}/overhead_raw.csv')
+cfg.setdefault('enable_experiment_logging', True)
+cfg.setdefault('attack_noise_amount', None)
+cfg.setdefault('attack_blocked_zero_metrics', True)
+cfg.setdefault('recovered_pearson_threshold', 0.98)
+cfg.setdefault('convergence_mode', False)
+cfg.setdefault('disable_attack_for_convergence', False)
+if args['seed'] is not None:
+    cfg['init_seed'] = int(args['seed'])
+    cfg['num_experiments'] = 1
+if args['experiment_method'] is not None:
+    cfg['experiment_method'] = args['experiment_method']
+if args['experiment_id'] is not None:
+    cfg['experiment_id'] = args['experiment_id']
+if args['results_dir'] is not None:
+    cfg['results_dir'] = args['results_dir']
+if args['leakage_results_csv'] is not None:
+    cfg['leakage_results_csv'] = args['leakage_results_csv']
+if args['epoch_results_csv'] is not None:
+    cfg['epoch_results_csv'] = args['epoch_results_csv']
+if args['overhead_results_csv'] is not None:
+    cfg['overhead_results_csv'] = args['overhead_results_csv']
+if args['enable_experiment_logging'] is not None:
+    cfg['enable_experiment_logging'] = args['enable_experiment_logging']
+if args['attack_noise_amount'] is not None:
+    cfg['attack_noise_amount'] = float(args['attack_noise_amount'])
+if args['attack_blocked_zero_metrics'] is not None:
+    cfg['attack_blocked_zero_metrics'] = args['attack_blocked_zero_metrics']
+if args['recovered_pearson_threshold'] is not None:
+    cfg['recovered_pearson_threshold'] = float(args['recovered_pearson_threshold'])
+if args['convergence_mode'] is not None:
+    cfg['convergence_mode'] = args['convergence_mode']
+if args['disable_attack_for_convergence'] is not None:
+    cfg['disable_attack_for_convergence'] = args['disable_attack_for_convergence']
+
+
+def safe_cfg_get(*keys, default=''):
+    for key in keys:
+        if key in cfg and cfg[key] is not None:
+            return cfg[key]
+    return default
+
+
+def ensure_dir(path):
+    if path:
+        makedir_exist_ok(path)
+
+
+def resolve_results_path(path_value):
+    if path_value is None:
+        return None
+    resolved = str(path_value).format(results_dir=cfg['results_dir'])
+    directory = os.path.dirname(resolved)
+    if directory:
+        ensure_dir(directory)
+    return resolved
+
+
+def now_seconds():
+    return time.perf_counter()
+
+
+def infer_experiment_method():
+    explicit = safe_cfg_get('experiment_method', default='unknown')
+    if explicit and explicit != 'unknown':
+        return str(explicit).lower()
+    if any(k in cfg for k in ['verifier_val_size', 'verifier_max_loss_increase', 'commit_rejection_response']):
+        return 'committee'
+    if any(k in cfg for k in ['ldp_enabled', 'local_dp', 'apply_ldp']):
+        return 'ldp'
+    if any(k in cfg for k in ['ddp_enabled', 'distributed_dp', 'apply_ddp']):
+        return 'ddp'
+    return 'base'
+
+
+def attack_execution_enabled():
+    return bool(safe_cfg_get('attack_commit_enabled', default=False)) and not (
+        bool(safe_cfg_get('convergence_mode', default=False))
+        and bool(safe_cfg_get('disable_attack_for_convergence', default=False))
+    )
+
+
+def detect_dp_mode():
+    method = str(cfg.get('experiment_method', 'unknown')).lower()
+    if method in {'ldp', 'ddp'}:
+        return method
+    return 'none'
+
+
+def resolve_experiment_defaults():
+    cfg['experiment_method'] = infer_experiment_method()
+    if cfg.get('experiment_id') in (None, '', 'default'):
+        cfg['experiment_id'] = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    if cfg.get('attack_noise_amount') is None:
+        cfg['attack_noise_amount'] = float(
+            safe_cfg_get('attack_commit_noise_scale', 'noise_scale', default=0.0) or 0.0
+        )
+    else:
+        cfg['attack_commit_noise_scale'] = float(cfg['attack_noise_amount'])
+    if cfg.get('noise_scale') is None:
+        cfg['noise_scale'] = safe_cfg_get('attack_commit_noise_scale', default=0.0)
+    cfg['leakage_results_csv'] = resolve_results_path(cfg['leakage_results_csv'])
+    cfg['epoch_results_csv'] = resolve_results_path(cfg['epoch_results_csv'])
+    cfg['overhead_results_csv'] = resolve_results_path(cfg['overhead_results_csv'])
+
+
+def append_csv_row(path, fieldnames, row):
+    if not cfg.get('enable_experiment_logging', True):
+        return
+    directory = os.path.dirname(path)
+    if directory:
+        ensure_dir(directory)
+    file_exists = os.path.exists(path)
+    with open(path, 'a', newline='', encoding='utf-8') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, '') for key in fieldnames})
+
+
+def empty_reconstruction_metrics():
+    return {
+        'best_pearson': 0.0,
+        'avg_pearson': 0.0,
+        'best_psnr': 0.0,
+        'avg_psnr': 0.0,
+        'num_recovered': 0,
+    }
+
+
+def merge_reconstruction_metrics(current_metrics, candidate_metrics):
+    merged = empty_reconstruction_metrics()
+    for key in merged:
+        merged[key] = max(current_metrics.get(key, 0.0), candidate_metrics.get(key, 0.0))
+    return merged
+
+
+def summarize_committee_status(event):
+    if event is None:
+        return {
+            'committee_enabled': cfg.get('experiment_method') == 'committee',
+            'committee_approved': '',
+            'candidate_rejected': False,
+            'attack_blocked': False,
+        }
+    approved = bool(event.get('approved', False))
+    return {
+        'committee_enabled': cfg.get('experiment_method') == 'committee',
+        'committee_approved': approved,
+        'candidate_rejected': not approved,
+        'attack_blocked': not approved,
+    }
+
+
+def write_epoch_result(row):
+    fieldnames = [
+        'experiment_id', 'experiment_method', 'seed', 'epoch', 'dataset', 'model_name',
+        'control_name', 'global_accuracy', 'global_loss', 'local_accuracy_mean',
+        'local_loss_mean', 'epoch_time_sec', 'train_time_sec', 'aggregation_time_sec',
+        'committee_time_sec', 'dp_time_sec', 'test_time_sec', 'attack_enabled',
+        'attack_round', 'committee_enabled', 'committee_approved_this_epoch',
+        'candidate_rejected_this_epoch',
+    ]
+    append_csv_row(cfg['epoch_results_csv'], fieldnames, row)
+
+
+def write_leakage_result(row):
+    fieldnames = [
+        'experiment_id', 'experiment_method', 'seed', 'dataset', 'model_name',
+        'control_name', 'global_epochs', 'local_epochs', 'local_train_size',
+        'batch_size_train', 'attack_source_round', 'attack_replay_round',
+        'attack_noise_amount', 'noise_scale', 'dp_mode', 'dp_clip_norm',
+        'dp_noise_multiplier', 'committee_enabled', 'committee_approved',
+        'attack_blocked', 'commit_rejection_response', 'best_pearson',
+        'avg_pearson', 'best_psnr', 'avg_psnr', 'num_recovered',
+        'total_runtime_sec', 'final_global_accuracy', 'final_global_loss',
+    ]
+    append_csv_row(cfg['leakage_results_csv'], fieldnames, row)
+
+
+def write_overhead_summary(row):
+    fieldnames = [
+        'experiment_id', 'experiment_method', 'seed', 'dataset', 'model_name',
+        'control_name', 'num_epochs', 'total_runtime_sec', 'mean_epoch_time_sec',
+        'mean_train_time_sec', 'mean_aggregation_time_sec', 'mean_committee_time_sec',
+        'mean_dp_time_sec', 'mean_test_time_sec', 'relative_notes',
+    ]
+    append_csv_row(cfg['overhead_results_csv'], fieldnames, row)
+
+
+def build_common_result_fields(seed):
+    return {
+        'experiment_id': cfg['experiment_id'],
+        'experiment_method': cfg['experiment_method'],
+        'seed': seed,
+        'dataset': cfg['data_name'],
+        'model_name': cfg['model_name'],
+        'control_name': cfg['control_name'],
+    }
+
+
+def mean_or_zero(values):
+    return float(sum(values) / len(values)) if values else 0.0
+
+
+def apply_runtime_overrides():
+    if args['global_epochs'] is not None:
+        cfg['num_epochs']['global'] = int(args['global_epochs'])
+    if args['local_epochs'] is not None:
+        cfg['num_epochs']['local'] = int(args['local_epochs'])
+    if args['train_batch_size'] is not None:
+        cfg['batch_size']['train'] = int(args['train_batch_size'])
+    if args['test_batch_size'] is not None:
+        cfg['batch_size']['test'] = int(args['test_batch_size'])
+
+
 full_path = os.getcwd() + "/" + cfg['file_output']
 fp = open(full_path, 'w')
-fp.write("N Max_Pearson Max_PSNR Max_Recovered\n")
+fp.write("N Max_Pearson Avg_Pearson Max_PSNR Avg_PSNR Max_Recovered\n")
 
 def compare_local_parameters(received, expected, atol=1e-6, rtol=1e-4):
     for k in expected:
@@ -280,7 +545,7 @@ def build_candidate_parent_for_commitment(epoch, federation, honest_aggregated_s
       candidate = replay of the parent used in this round (federation.initial_parent_state),
       optionally with additive noise
     """
-    attack_enabled = bool(cfg.get('attack_commit_enabled', True))
+    attack_enabled = attack_execution_enabled()
     attack_source_round = int(cfg.get('attack_source_round', 3))
     attack_replay_round = int(cfg.get('attack_replay_round', 4))
     commit_noise_scale = float(cfg.get('attack_commit_noise_scale', 0.0))
@@ -538,6 +803,8 @@ def verify_and_commit_candidate_parent(
 
 def main():
     process_control()
+    apply_runtime_overrides()
+    resolve_experiment_defaults()
     seeds = list(range(cfg['init_seed'], cfg['init_seed'] + cfg['num_experiments']))
     for i in range(cfg['num_experiments']):
         model_tag_list = [str(seeds[i]), cfg['data_name'], cfg['subset'], cfg['model_name'], cfg['control_name']]
@@ -569,6 +836,16 @@ def runExperiment():
     model = eval('models.{}(model_rate=cfg["global_model_rate"]).to(cfg["device"])'.format(cfg['model_name']))
     optimizer = make_optimizer(model, cfg['lr'])
     scheduler = make_scheduler(optimizer)
+    experiment_tracker = {
+        'seed': seed,
+        'epoch_rows': [],
+        'last_reconstruction': empty_reconstruction_metrics(),
+        'committee_approved': '',
+        'attack_blocked': False,
+        'final_global_accuracy': 0.0,
+        'final_global_loss': 0.0,
+    }
+    total_runtime_start = now_seconds()
     if cfg['resume_mode'] == 1:
         last_epoch, data_split, label_split, model, optimizer, scheduler, logger = resume(model, cfg['model_tag'],
                                                                                           optimizer, scheduler)
@@ -614,6 +891,7 @@ def runExperiment():
 
 
     for epoch in range(last_epoch, cfg['num_epochs']['global'] + 1):
+        epoch_start = now_seconds()
         logger.safe(True)
 
         approved_parent_record = round_log_module.get_latest_approved_parent()
@@ -622,7 +900,7 @@ def runExperiment():
         global_parameters = copy.deepcopy(approved_parent_state)
 
         federation = Federation(epoch, global_parameters, cfg['model_rate'], label_split)
-        train(
+        train_context = train(
             model_history_block2,
             model_history_fcnn,
             fcnn_attack_cache,
@@ -635,14 +913,43 @@ def runExperiment():
             logger,
             epoch,
             round_log_module,
-            runtime_control
+            runtime_control,
+            experiment_tracker
         )
+        test_start = now_seconds()
         test_model = stats(dataset['train'], model)
         test(dataset['test'], data_split['test'], label_split, test_model, logger, epoch)
+        test_time_sec = now_seconds() - test_start
         if cfg['scheduler_name'] == 'ReduceLROnPlateau':
             scheduler.step(metrics=logger.mean['train/{}'.format(cfg['pivot_metric'])])
         else:
             scheduler.step()
+        epoch_time_sec = now_seconds() - epoch_start
+        final_global_accuracy = float(logger.mean.get('test/Global-Accuracy', 0.0))
+        final_global_loss = float(logger.mean.get('test/Global-Loss', 0.0))
+        experiment_tracker['final_global_accuracy'] = final_global_accuracy
+        experiment_tracker['final_global_loss'] = final_global_loss
+        epoch_row = {
+            **build_common_result_fields(seed),
+            'epoch': int(epoch),
+            'global_accuracy': final_global_accuracy,
+            'global_loss': final_global_loss,
+            'local_accuracy_mean': float(logger.mean.get('train/Local-Accuracy', 0.0)),
+            'local_loss_mean': float(logger.mean.get('train/Local-Loss', 0.0)),
+            'epoch_time_sec': epoch_time_sec,
+            'train_time_sec': float(train_context.get('train_time_sec', 0.0)),
+            'aggregation_time_sec': float(train_context.get('aggregation_time_sec', 0.0)),
+            'committee_time_sec': float(train_context.get('committee_time_sec', 0.0)),
+            'dp_time_sec': float(train_context.get('dp_time_sec', 0.0)),
+            'test_time_sec': test_time_sec,
+            'attack_enabled': bool(train_context.get('attack_enabled', False)),
+            'attack_round': bool(train_context.get('attack_round', False)),
+            'committee_enabled': bool(train_context.get('committee_enabled', False)),
+            'committee_approved_this_epoch': train_context.get('committee_approved_this_epoch', ''),
+            'candidate_rejected_this_epoch': bool(train_context.get('candidate_rejected_this_epoch', False)),
+        }
+        experiment_tracker['epoch_rows'].append(epoch_row)
+        write_epoch_result(epoch_row)
         logger.safe(False)
         model_state_dict = model.state_dict()
         save_result = {
@@ -655,12 +962,79 @@ def runExperiment():
             shutil.copy('./output/model/{}_checkpoint.pt'.format(cfg['model_tag']),
                         './output/model/{}_best.pt'.format(cfg['model_tag']))
         logger.reset()
+    total_runtime_sec = now_seconds() - total_runtime_start
+    epoch_rows = experiment_tracker['epoch_rows']
+    train_times = [float(row['train_time_sec']) for row in epoch_rows]
+    aggregation_times = [float(row['aggregation_time_sec']) for row in epoch_rows]
+    committee_times = [float(row['committee_time_sec']) for row in epoch_rows]
+    dp_times = [float(row['dp_time_sec']) for row in epoch_rows]
+    test_times = [float(row['test_time_sec']) for row in epoch_rows]
+    epoch_times = [float(row['epoch_time_sec']) for row in epoch_rows]
+    reconstruction_metrics = experiment_tracker.get('last_reconstruction', empty_reconstruction_metrics())
+    leakage_row = {
+        **build_common_result_fields(seed),
+        'global_epochs': cfg['num_epochs']['global'],
+        'local_epochs': cfg['num_epochs']['local'],
+        'local_train_size': cfg['local_train_size'],
+        'batch_size_train': safe_cfg_get('batch_size', default={}).get('train', ''),
+        'attack_source_round': safe_cfg_get('attack_source_round', default=''),
+        'attack_replay_round': safe_cfg_get('attack_replay_round', default=''),
+        'attack_noise_amount': cfg['attack_noise_amount'],
+        'noise_scale': safe_cfg_get('noise_scale', default=''),
+        'dp_mode': detect_dp_mode(),
+        'dp_clip_norm': safe_cfg_get('clip_norm', 'dp_clip_norm', default=''),
+        'dp_noise_multiplier': safe_cfg_get('noise_multiplier', 'dp_noise_multiplier', default=''),
+        'committee_enabled': cfg['experiment_method'] == 'committee',
+        'committee_approved': experiment_tracker.get('committee_approved', ''),
+        'attack_blocked': experiment_tracker.get('attack_blocked', False),
+        'commit_rejection_response': safe_cfg_get('commit_rejection_response', default=''),
+        'best_pearson': reconstruction_metrics['best_pearson'],
+        'avg_pearson': reconstruction_metrics['avg_pearson'],
+        'best_psnr': reconstruction_metrics['best_psnr'],
+        'avg_psnr': reconstruction_metrics['avg_psnr'],
+        'num_recovered': reconstruction_metrics['num_recovered'],
+        'total_runtime_sec': total_runtime_sec,
+        'final_global_accuracy': experiment_tracker['final_global_accuracy'],
+        'final_global_loss': experiment_tracker['final_global_loss'],
+    }
+    write_leakage_result(leakage_row)
+    write_overhead_summary({
+        **build_common_result_fields(seed),
+        'num_epochs': cfg['num_epochs']['global'],
+        'total_runtime_sec': total_runtime_sec,
+        'mean_epoch_time_sec': mean_or_zero(epoch_times),
+        'mean_train_time_sec': mean_or_zero(train_times),
+        'mean_aggregation_time_sec': mean_or_zero(aggregation_times),
+        'mean_committee_time_sec': mean_or_zero(committee_times),
+        'mean_dp_time_sec': mean_or_zero(dp_times),
+        'mean_test_time_sec': mean_or_zero(test_times),
+        'relative_notes': 'convergence_mode={} disable_attack_for_convergence={}'.format(
+            cfg['convergence_mode'], cfg['disable_attack_for_convergence']
+        ),
+    })
     logger.safe(False)
     return
 
 
-def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, transparency_log, runtime_control):
+def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, transparency_log, runtime_control, experiment_tracker):
     global_model.load_state_dict(federation.global_parameters)
+    attack_enabled = attack_execution_enabled()
+    attack_round = attack_enabled and int(epoch) in {
+        int(safe_cfg_get('attack_source_round', default=-1)),
+        int(safe_cfg_get('attack_replay_round', default=-1)),
+    }
+    committee_enabled = cfg.get('experiment_method') == 'committee'
+    committee_status = {
+        'committee_enabled': committee_enabled,
+        'committee_approved': '',
+        'candidate_rejected': False,
+        'attack_blocked': False,
+    }
+    train_time_sec = 0.0
+    aggregation_time_sec = 0.0
+    committee_time_sec = 0.0
+    dp_time_sec = 0.0
+
     if runtime_control.get('skip_next_epoch', False):
         runtime_control['skip_next_epoch'] = False
         skip_reason = runtime_control.get('skip_reason', 'rejected_previous_round')
@@ -680,15 +1054,25 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
             flush=True
         )
 
-        return
+        return {
+            'train_time_sec': train_time_sec,
+            'aggregation_time_sec': aggregation_time_sec,
+            'committee_time_sec': committee_time_sec,
+            'dp_time_sec': dp_time_sec,
+            'attack_enabled': attack_enabled,
+            'attack_round': attack_round,
+            'committee_enabled': committee_enabled,
+            'committee_approved_this_epoch': '',
+            'candidate_rejected_this_epoch': False,
+        }
+
     global_model.train(True)
     local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, transparency_log, logger)
     distributed_local_parameters = copy.deepcopy(local_parameters)
     num_active_users = len(local)
-    lr = optimizer.param_groups[0]['lr']
 
     start_time = time.time()
-
+    train_timer_start = now_seconds()
     img_list_by_user = {}
 
     for m in range(num_active_users):
@@ -702,7 +1086,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
             epoch_finished_time = datetime.timedelta(seconds=local_time * (num_active_users - m - 1))
             exp_finished_time = epoch_finished_time + datetime.timedelta(
                 seconds=round((cfg['num_epochs']['global'] - epoch) * local_time * num_active_users))
-            info = {'info': ['Model: {}'.format(cfg['model_tag']), 
+            info = {'info': ['Model: {}'.format(cfg['model_tag']),
                              'Train Epoch: {}({:.0f}%)'.format(epoch, 100. * m / num_active_users),
                              'ID: {}({}/{})'.format(user_idx[m], m + 1, num_active_users),
                              'Learning rate: {}'.format(lr),
@@ -710,15 +1094,16 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
                              'Epoch Finished Time: {}'.format(epoch_finished_time),
                              'Experiment Finished Time: {}'.format(exp_finished_time)]}
             logger.append(info, 'train', mean=False)
-            logger.write('train', cfg['metric_name']['train']['Local'])   
-    
+            logger.write('train', cfg['metric_name']['train']['Local'])
+    train_time_sec = now_seconds() - train_timer_start
+
+    aggregation_timer_start = now_seconds()
     federation.combine(local_parameters, param_idx, user_idx)
+    aggregation_time_sec = now_seconds() - aggregation_timer_start
 
     honest_aggregated_state = clone_state_dict(federation.global_parameters)
-    if cfg['model_name'] == 'fcnn':
+    if cfg['model_name'] == 'fcnn' and attack_enabled:
         attack_source_round = int(cfg.get('attack_source_round', 3))
-        attack_replay_round = int(cfg.get('attack_replay_round', 4))
-
         if epoch == attack_source_round:
             for key in ['layers.0.weight', 'layers.0.bias']:
                 fcnn_attack_cache['source_honest_parent'][key] = clone_state_dict(honest_aggregated_state)[key]
@@ -730,6 +1115,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
         logger,
     )
 
+    committee_timer_start = now_seconds()
     commitment_event = verify_and_commit_candidate_parent(
         transparency_log,
         epoch,
@@ -740,6 +1126,12 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
         label_split,
         logger,
         candidate_meta=candidate_meta,
+    )
+    committee_time_sec += now_seconds() - committee_timer_start
+    committee_status = summarize_committee_status(commitment_event)
+    experiment_tracker['committee_approved'] = committee_status['committee_approved']
+    experiment_tracker['attack_blocked'] = bool(
+        experiment_tracker.get('attack_blocked', False) or committee_status['attack_blocked']
     )
 
     final_parent_state = None
@@ -792,6 +1184,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
                 'fallback_triggered_by_commitment_id': commitment_event['commitment_id'],
             }
 
+            fallback_committee_timer_start = now_seconds()
             fallback_event = verify_and_commit_candidate_parent(
                 transparency_log,
                 epoch,
@@ -803,6 +1196,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
                 logger,
                 candidate_meta=fallback_meta,
             )
+            committee_time_sec += now_seconds() - fallback_committee_timer_start
 
             if fallback_event['approved']:
                 final_parent_state = clone_state_dict(honest_aggregated_state)
@@ -847,42 +1241,33 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
             f"training continues from last approved parent",
             flush=True
         )
-    if cfg['model_name'] == 'fcnn':
+
+    if cfg['model_name'] == 'fcnn' and attack_enabled:
         attack_replay_round = int(cfg.get('attack_replay_round', 4))
 
         if round_was_skipped:
-            # Rejected round must not become the replay result used by inversion
             fcnn_attack_cache['replay_result_parent'].clear()
-
         elif epoch == attack_replay_round:
             for key in ['layers.0.weight', 'layers.0.bias']:
                 fcnn_attack_cache['replay_result_parent'][key] = global_model_state_dict_copy[key].detach().clone()
 
-    # Append to the model history. 
     if cfg['model_name'] == 'fcnn':
         targetWeights = ['layers.0.weight']
         targetBiases = ['layers.0.bias']
-
-        attack_source_round = int(cfg.get('attack_source_round', 3))
+        round_reconstruction_metrics = empty_reconstruction_metrics()
         attack_replay_round = int(cfg.get('attack_replay_round', 4))
 
         for m in range(num_active_users):
             weight_grad = None
             bias_grad = None
+            user_reconstruction_metrics = empty_reconstruction_metrics()
 
-            max_pearson_overall = 0.0
-            max_psnr_overall = 0.0
-            max_pearson_list = []
-            max_psnr_list = []
-            num_recovered_list = []
-
-            # Only target the 0.25 cohort
             if federation.model_rate[user_idx[m]] != 0.25:
                 continue
 
             for k, v in global_model_state_dict_copy.items():
                 if k in targetWeights or k in targetBiases:
-                    if epoch == attack_replay_round and not round_was_skipped and not runtime_control.get('skip_next_epoch', False):
+                    if attack_enabled and epoch == attack_replay_round and not round_was_skipped and not runtime_control.get('skip_next_epoch', False):
                         distributed_model = distributed_local_parameters[m][k]
 
                         num_source_contributors, num_replay_contributors = get_fcnn_shifted_block_contributor_counts(
@@ -944,32 +1329,50 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
 
                 if bias_grad_sum != 0.0:
                     target_img_list = img_list_by_user.get(int(user_idx[m]), None)
-
                     if target_img_list is not None and len(target_img_list) > 0:
-                        (max_pearson, max_psnr, num_recovered) = reconstruct_image(
-                            weight_grad, bias_grad, target_img_list
-                        )
+                        user_reconstruction_metrics = reconstruct_image(weight_grad, bias_grad, target_img_list)
                     else:
                         print(
                             f"RECONSTRUCT: skipped because no image batch was recorded for target user {user_idx[m]}",
                             flush=True
                         )
-                        max_pearson_overall = max(max_pearson_overall, max_pearson)
-                        max_psnr_overall = max(max_psnr_overall, max_psnr)
-                        max_pearson_list.append(max_pearson)
-                        max_psnr_list.append(max_psnr)
-                        num_recovered_list.append(num_recovered)
-                    
 
-            if len(max_pearson_list) > 0:
-                N_Table = cfg['local_train_size']
-                Max_Pearson_Table = max(max_pearson_list)
-                Max_PSNR_Table = max(max_psnr_list)
-                Max_Recovered_Table = max(num_recovered_list)
-                fp.write("%s %s %s %s\n" % (
-                    N_Table, Max_Pearson_Table, Max_PSNR_Table, Max_Recovered_Table
-                ))
+            round_reconstruction_metrics['best_pearson'] = max(
+                round_reconstruction_metrics['best_pearson'],
+                user_reconstruction_metrics['best_pearson']
+            )
+            round_reconstruction_metrics['avg_pearson'] = max(
+                round_reconstruction_metrics['avg_pearson'],
+                user_reconstruction_metrics['avg_pearson']
+            )
+            round_reconstruction_metrics['best_psnr'] = max(
+                round_reconstruction_metrics['best_psnr'],
+                user_reconstruction_metrics['best_psnr']
+            )
+            round_reconstruction_metrics['avg_psnr'] = max(
+                round_reconstruction_metrics['avg_psnr'],
+                user_reconstruction_metrics['avg_psnr']
+            )
+            round_reconstruction_metrics['num_recovered'] = max(
+                round_reconstruction_metrics['num_recovered'],
+                user_reconstruction_metrics['num_recovered']
+            )
 
+        if not attack_enabled and cfg.get('attack_blocked_zero_metrics', True):
+            round_reconstruction_metrics = empty_reconstruction_metrics()
+
+        fp.write("%s %s %s %s %s %s\n" % (
+            cfg['local_train_size'],
+            round_reconstruction_metrics['best_pearson'],
+            round_reconstruction_metrics['avg_pearson'],
+            round_reconstruction_metrics['best_psnr'],
+            round_reconstruction_metrics['avg_psnr'],
+            round_reconstruction_metrics['num_recovered'],
+        ))
+        experiment_tracker['last_reconstruction'] = merge_reconstruction_metrics(
+            experiment_tracker.get('last_reconstruction', empty_reconstruction_metrics()),
+            round_reconstruction_metrics,
+        )
 
     if cfg['model_name'] == 'conv':
         targetWeights = ['blocks.2.weight']
@@ -980,10 +1383,20 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
                     if v.dim() <= 1:
                         if (k in targetWeights or k in targetBiases):
                             model_history_block2[k].append(global_model_state_dict_copy[k])
-                            if (epoch == 2): 
+                            if (epoch == 2):
                                 gradient_leakage(k, user_idx[m], num_active_users, federation.model_rate[user_idx[m]], local_parameters[m][k], model_history_block2[k])
 
-    return
+    return {
+        'train_time_sec': train_time_sec,
+        'aggregation_time_sec': aggregation_time_sec,
+        'committee_time_sec': committee_time_sec,
+        'dp_time_sec': dp_time_sec,
+        'attack_enabled': attack_enabled,
+        'attack_round': attack_round,
+        'committee_enabled': committee_enabled,
+        'committee_approved_this_epoch': committee_status['committee_approved'],
+        'candidate_rejected_this_epoch': committee_status['candidate_rejected'],
+    }
 
 def reconstruct_image(weight_grad, bias_grad, img_list):
     count = 0
@@ -991,6 +1404,7 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
     avg_ssim = []
     avg_pearson = []
     num_recovered = 0
+    threshold = float(safe_cfg_get('recovered_pearson_threshold', default=0.98))
 
     # Define rows and columns for plot. 
     rows = 2
@@ -1045,7 +1459,7 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
             if max_pearson == pearson_coef:
                 best_partial_recon = partial_recon
 
-        if max_pearson >= 0.98:
+        if max_pearson >= threshold:
             num_recovered = num_recovered + 1
 
         avg_ssim.append(max_ssim)
@@ -1065,20 +1479,31 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
         # plt.savefig(fig_save_str)
     if len(avg_pearson) == 0:
         print("RECONSTRUCT: no valid partial reconstructions", flush=True)
-        return (0.0, 0.0, 0)
-    print("RECONSTRUCT: best_ssim across images = %s"%(max(avg_ssim)))
-    print("RECONSTRUCT: best_psnr across images = %s"%(max(avg_psnr)))
-    print("RECONSTRUCT: best_pearson across images = %s"%(max(avg_pearson)))
+        return empty_reconstruction_metrics()
+    best_ssim = max(avg_ssim)
+    best_psnr = max(avg_psnr)
+    best_pearson = max(avg_pearson)
+    avg_psnr_value = sum(avg_psnr) / len(avg_psnr)
+    avg_pearson_value = sum(avg_pearson) / len(avg_pearson)
+    print("RECONSTRUCT: best_ssim across images = %s"%(best_ssim))
+    print("RECONSTRUCT: best_psnr across images = %s"%(best_psnr))
+    print("RECONSTRUCT: best_pearson across images = %s"%(best_pearson))
     print("RECONSTRUCT: num_recovered = %s"%(num_recovered))
 
     print("RECONSTRUCT: avg_ssim across images = %s"%(sum(avg_ssim) / len(avg_ssim)))
-    print("RECONSTRUCT: avg_psnr across images = %s"%(sum(avg_psnr) / len(avg_psnr)))
-    print("RECONSTRUCT: avg_pearson across images = %s"%(sum(avg_pearson) / len(avg_pearson)))
+    print("RECONSTRUCT: avg_psnr across images = %s"%(avg_psnr_value))
+    print("RECONSTRUCT: avg_pearson across images = %s"%(avg_pearson_value))
 
     # plt.show() 
     # plt.savefig('orig_recon_rolex_n%s_v2_noise.png'%(cfg['local_train_size']))
 
-    return (max(avg_pearson), max(avg_psnr), num_recovered)
+    return {
+        'best_pearson': best_pearson,
+        'avg_pearson': avg_pearson_value,
+        'best_psnr': best_psnr,
+        'avg_psnr': avg_psnr_value,
+        'num_recovered': num_recovered,
+    }
 
 
 

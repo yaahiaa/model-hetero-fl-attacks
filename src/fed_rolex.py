@@ -30,6 +30,9 @@ class Federation:
         self.hybrid_trap_cache = {}
         self.make_model_rate()
 
+    def _attack_disabled_for_convergence(self):
+        return bool(cfg.get('convergence_mode', False)) and bool(cfg.get('disable_attack_for_convergence', False))
+
     def make_model_rate(self):
         if cfg['model_split_mode'] == 'dynamic':
             rate_idx = torch.multinomial(torch.tensor(cfg['proportion']), num_samples=cfg['num_users'],
@@ -265,6 +268,8 @@ class Federation:
         return local_parameters, param_idx
 
     def _hybrid_trap_enabled_for_round(self):
+        if self._attack_disabled_for_convergence():
+            return False
         if cfg.get('attack_model_mode', 'real_replay') != 'hybrid_trap':
             return False
         if cfg['model_name'] != 'fcnn':
@@ -390,6 +395,7 @@ class Federation:
         # hybrid_trap optionally overrides only the attacked FCNN first-layer block.
         local_parameters, param_idx = self.extract_honest_local_parameters(user_idx)
         hybrid_trap_events = []
+        attack_enabled = not self._attack_disabled_for_convergence()
 
         if self._hybrid_trap_enabled_for_round():
             hybrid_trap_events = self._apply_hybrid_trap_overrides(local_parameters, param_idx, user_idx)
@@ -407,7 +413,8 @@ class Federation:
                 'model_rate': float(self.model_rate[uid]),
                 'attack_model_mode': cfg.get('attack_model_mode', 'real_replay'),
                 'target_shift_applied': bool(
-                    cfg['model_name'] == 'fcnn'
+                    attack_enabled
+                    and cfg['model_name'] == 'fcnn'
                     and float(self.model_rate[uid]) == 0.25
                     and int(self.rd) == replay_round
                 ),
