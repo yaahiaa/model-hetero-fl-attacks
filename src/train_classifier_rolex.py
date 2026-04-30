@@ -53,28 +53,43 @@ def str_to_bool(value):
 
 
 parser = argparse.ArgumentParser(description='cfg')
+
 for k in cfg:
     exec('parser.add_argument(\'--{0}\', default=cfg[\'{0}\'], type=type(cfg[\'{0}\']))'.format(k))
-parser.add_argument('--control_name', default=None, type=str)
-parser.add_argument('--seed', default=None, type=int)
-parser.add_argument('--global_epochs', default=None, type=int)
-parser.add_argument('--local_epochs', default=None, type=int)
-parser.add_argument('--local_train_size', default=None, type=int)
-parser.add_argument('--train_batch_size', default=None, type=int)
-parser.add_argument('--test_batch_size', default=None, type=int)
-parser.add_argument('--experiment_method', default=None, type=str)
-parser.add_argument('--experiment_id', default=None, type=str)
-parser.add_argument('--results_dir', default=None, type=str)
-parser.add_argument('--leakage_results_csv', default=None, type=str)
-parser.add_argument('--epoch_results_csv', default=None, type=str)
-parser.add_argument('--overhead_results_csv', default=None, type=str)
-parser.add_argument('--enable_experiment_logging', default=None, type=str_to_bool)
-parser.add_argument('--attack_noise_amount', default=None, type=float)
-parser.add_argument('--noise_scale', default=None, type=float)
-parser.add_argument('--attack_blocked_zero_metrics', default=None, type=str_to_bool)
-parser.add_argument('--recovered_pearson_threshold', default=None, type=float)
-parser.add_argument('--convergence_mode', default=None, type=str_to_bool)
-parser.add_argument('--disable_attack_for_convergence', default=None, type=str_to_bool)
+
+
+def add_arg_if_missing(*args, **kwargs):
+    option = args[0]
+    existing_options = {
+        opt
+        for action in parser._actions
+        for opt in action.option_strings
+    }
+    if option not in existing_options:
+        parser.add_argument(*args, **kwargs)
+
+
+add_arg_if_missing('--control_name', default=None, type=str)
+add_arg_if_missing('--seed', default=None, type=int)
+add_arg_if_missing('--global_epochs', default=None, type=int)
+add_arg_if_missing('--local_epochs', default=None, type=int)
+add_arg_if_missing('--local_train_size', default=None, type=int)
+add_arg_if_missing('--train_batch_size', default=None, type=int)
+add_arg_if_missing('--test_batch_size', default=None, type=int)
+
+add_arg_if_missing('--experiment_method', default=None, type=str)
+add_arg_if_missing('--experiment_id', default=None, type=str)
+add_arg_if_missing('--results_dir', default=None, type=str)
+add_arg_if_missing('--leakage_results_csv', default=None, type=str)
+add_arg_if_missing('--epoch_results_csv', default=None, type=str)
+add_arg_if_missing('--overhead_results_csv', default=None, type=str)
+add_arg_if_missing('--enable_experiment_logging', default=None, type=str_to_bool)
+add_arg_if_missing('--attack_noise_amount', default=None, type=float)
+add_arg_if_missing('--noise_scale', default=None, type=float)
+add_arg_if_missing('--attack_blocked_zero_metrics', default=None, type=str_to_bool)
+add_arg_if_missing('--recovered_pearson_threshold', default=None, type=float)
+add_arg_if_missing('--convergence_mode', default=None, type=str_to_bool)
+add_arg_if_missing('--disable_attack_for_convergence', default=None, type=str_to_bool)
 args = vars(parser.parse_args())
 for k in cfg:
     cfg[k] = args[k]
