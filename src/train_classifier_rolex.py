@@ -342,6 +342,63 @@ def clone_state_dict(state_dict):
             cloned[k] = copy.deepcopy(v)
     return cloned
 
+def add_uniform_noise_to_state_dict(state_dict, noise_scale):
+    """
+    Add prototype3-h style attack noise to a parent/global state dict.
+
+    For each floating tensor v:
+        noise ~ Uniform(-noise_scale * mean(abs(v)),
+                         noise_scale * mean(abs(v)))
+
+    Non-floating tensors are left unchanged.
+    """
+    noisy = clone_state_dict(state_dict)
+
+    if noise_scale is None or float(noise_scale) <= 0.0:
+        return noisy, {
+            'noise_enabled': False,
+            'noise_scale': float(noise_scale or 0.0),
+            'noise_rel_l2': 0.0,
+            'noise_max_abs': 0.0,
+            'noise_mean_abs': 0.0,
+        }
+
+    total_noise_sq = 0.0
+    total_base_sq = 0.0
+    max_abs = 0.0
+    total_abs = 0.0
+    total_count = 0
+
+    for k, v in noisy.items():
+        if not torch.is_tensor(v) or not torch.is_floating_point(v):
+            continue
+
+        mean_abs = torch.mean(torch.abs(v)).item()
+        if not np.isfinite(mean_abs) or mean_abs == 0.0:
+            continue
+
+        delta = float(noise_scale) * mean_abs
+        noise = torch.empty_like(v).uniform_(-delta, delta)
+        noisy[k] = v + noise
+
+        total_noise_sq += float(torch.sum(noise.float() ** 2).item())
+        total_base_sq += float(torch.sum(v.float() ** 2).item())
+
+        abs_noise = torch.abs(noise).detach().float()
+        max_abs = max(max_abs, float(torch.max(abs_noise).item()))
+        total_abs += float(torch.sum(abs_noise).item())
+        total_count += int(abs_noise.numel())
+
+    rel_l2 = float(np.sqrt(total_noise_sq) / (np.sqrt(total_base_sq) + 1.0e-12))
+    mean_abs = float(total_abs / max(total_count, 1))
+
+    return noisy, {
+        'noise_enabled': True,
+        'noise_scale': float(noise_scale),
+        'noise_rel_l2': rel_l2,
+        'noise_max_abs': max_abs,
+        'noise_mean_abs': mean_abs,
+    }
 
 def get_dp_mode():
     mode = str(cfg.get('dp_mode', 'none')).lower()
@@ -731,15 +788,36 @@ def train(model_history_block2, model_history_fcnn, fcnn_attack_cache, dataset, 
 
         if attack_enabled:
             # This is the malicious server action:
-            # instead of using the honest aggregate from round 3 as parent for round 4,
-            # replay the real parent that was used at the start of round 3.
-            federation.global_parameters = clone_state_dict(federation.initial_parent_state)
+            # instead of using the honest aggregate from the source round as parent for
+            # the replay round, replay the real parent that was used at the start of
+            # the source round. If configured, apply the same style
+            # uniform attack noise to the replayed parent before distributing it.
+            attack_noise_scale = float(
+                cfg.get(
+                    'attack_noise_amount',
+                    cfg.get('noise_scale', 0.0),
+                ) or 0.0
+            )
+
+            if attack_noise_scale <= 0.0:
+                attack_noise_scale = float(cfg.get('noise_scale', 0.0) or 0.0)
+
+            federation.global_parameters, replay_noise_report = add_uniform_noise_to_state_dict(
+                federation.initial_parent_state,
+                attack_noise_scale,
+            )
+
             attack_round = True
 
             if cfg.get('debug_attack_replay', False):
                 print(
                     f'[REPLAY] epoch={epoch}: stored honest source aggregate, '
-                    f'but replayed previous real parent for epoch {epoch + 1}',
+                    f'but replayed previous real parent for epoch {epoch + 1} '
+                    f'with attack_noise_scale={attack_noise_scale} '
+                    f'noise_enabled={replay_noise_report["noise_enabled"]} '
+                    f'noise_rel_l2={replay_noise_report["noise_rel_l2"]:.6e} '
+                    f'noise_max_abs={replay_noise_report["noise_max_abs"]:.6e} '
+                    f'noise_mean_abs={replay_noise_report["noise_mean_abs"]:.6e}',
                     flush=True,
                 )
         else:
