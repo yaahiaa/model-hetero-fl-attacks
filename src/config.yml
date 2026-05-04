@@ -62,6 +62,7 @@ verifier_max_loss_increase : 0.05
 verifier_max_acc_drop : 5.0
 verifier_min_relative_change : 0.1
 verifier_max_relative_change : 0.6
+verifier_behavior_freeze_min_relative_change : 0.04
 verifier_structure_warmup_rounds : 2
 
 # replay-commit attack / prototype-2 debug
