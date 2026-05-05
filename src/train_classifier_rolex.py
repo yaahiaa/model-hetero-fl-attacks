@@ -35,7 +35,12 @@ from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from torchvision import transforms
 import round_log as round_log_module
-from commitment_architecture import CommitmentService, JsonCommitmentLedger, LocalArtifactStore, VerificationReport
+from commitment_architecture import (
+    CommitmentService,
+    VerificationReport,
+    apply_commitment_config_defaults,
+    create_commitment_service_from_cfg,
+)
 from round_log import TransparencyLog, hash_state_dict
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -83,6 +88,17 @@ parser.add_argument('--commitment_architecture_enabled', default=None, type=str_
 parser.add_argument('--commitment_artifact_dirname', default=None, type=str)
 parser.add_argument('--commitment_ledger_filename', default=None, type=str)
 parser.add_argument('--commitment_quorum_rule', default=None, type=str)
+parser.add_argument('--ipfs_api_url', default=None, type=str)
+parser.add_argument('--ipfs_gateway_url', default=None, type=str)
+parser.add_argument('--ipfs_pin', default=None, type=str_to_bool)
+parser.add_argument('--ipfs_timeout_sec', default=None, type=float)
+parser.add_argument('--ipfs_cid_version', default=None, type=int)
+parser.add_argument('--ipfs_backend_enabled', default=None, type=str_to_bool)
+parser.add_argument('--fabric_estimate_tx_latency_sec', default=None, type=float)
+parser.add_argument('--fabric_estimate_throughput_tps', default=None, type=float)
+parser.add_argument('--fabric_estimate_storage_per_update_mb', default=None, type=float)
+parser.add_argument('--fabric_estimate_enabled', default=None, type=str_to_bool)
+parser.add_argument('--fabric_estimate_sleep', default=None, type=str_to_bool)
 args = vars(parser.parse_args())
 for k in cfg:
     cfg[k] = args[k]
@@ -140,6 +156,7 @@ cfg.setdefault('commitment_architecture_enabled', True)
 cfg.setdefault('commitment_artifact_dirname', 'artifacts')
 cfg.setdefault('commitment_ledger_filename', 'commitment_ledger.json')
 cfg.setdefault('commitment_quorum_rule', 'majority')
+apply_commitment_config_defaults(cfg)
 if args['seed'] is not None:
     cfg['init_seed'] = int(args['seed'])
     cfg['num_experiments'] = 1
@@ -181,6 +198,28 @@ if args['commitment_ledger_filename'] is not None:
     cfg['commitment_ledger_filename'] = args['commitment_ledger_filename']
 if args['commitment_quorum_rule'] is not None:
     cfg['commitment_quorum_rule'] = args['commitment_quorum_rule']
+if args['ipfs_api_url'] is not None:
+    cfg['ipfs_api_url'] = args['ipfs_api_url']
+if args['ipfs_gateway_url'] is not None:
+    cfg['ipfs_gateway_url'] = args['ipfs_gateway_url']
+if args['ipfs_pin'] is not None:
+    cfg['ipfs_pin'] = args['ipfs_pin']
+if args['ipfs_timeout_sec'] is not None:
+    cfg['ipfs_timeout_sec'] = float(args['ipfs_timeout_sec'])
+if args['ipfs_cid_version'] is not None:
+    cfg['ipfs_cid_version'] = int(args['ipfs_cid_version'])
+if args['ipfs_backend_enabled'] is not None:
+    cfg['ipfs_backend_enabled'] = args['ipfs_backend_enabled']
+if args['fabric_estimate_tx_latency_sec'] is not None:
+    cfg['fabric_estimate_tx_latency_sec'] = float(args['fabric_estimate_tx_latency_sec'])
+if args['fabric_estimate_throughput_tps'] is not None:
+    cfg['fabric_estimate_throughput_tps'] = float(args['fabric_estimate_throughput_tps'])
+if args['fabric_estimate_storage_per_update_mb'] is not None:
+    cfg['fabric_estimate_storage_per_update_mb'] = float(args['fabric_estimate_storage_per_update_mb'])
+if args['fabric_estimate_enabled'] is not None:
+    cfg['fabric_estimate_enabled'] = args['fabric_estimate_enabled']
+if args['fabric_estimate_sleep'] is not None:
+    cfg['fabric_estimate_sleep'] = args['fabric_estimate_sleep']
 
 
 def safe_cfg_get(*keys, default=''):
@@ -379,31 +418,15 @@ def resolve_commitment_quorum_rule():
 
 
 def create_commitment_backend():
-    round_log_dir = cfg.get('round_log_dir') or os.path.join('output', 'round_log', 'prototype2')
-
     if not commitment_architecture_enabled():
+        round_log_dir = cfg.get('round_log_dir') or os.path.join('output', 'round_log', 'prototype2')
         return TransparencyLog(round_log_dir)
 
-    artifact_backend = str(cfg.get('artifact_store_backend', 'local')).lower()
-    ledger_backend = str(cfg.get('ledger_backend', 'json')).lower()
     commitment_backend = str(cfg.get('commitment_backend', 'local')).lower()
 
     if commitment_backend != 'local':
-        raise ValueError(f'Unsupported commitment_backend for Phase 1: {commitment_backend}')
-    if artifact_backend != 'local':
-        raise ValueError(f'Unsupported artifact_store_backend for Phase 1: {artifact_backend}')
-    if ledger_backend != 'json':
-        raise ValueError(f'Unsupported ledger_backend for Phase 1: {ledger_backend}')
-
-    artifact_store = LocalArtifactStore(
-        round_log_dir,
-        artifact_dirname=cfg.get('commitment_artifact_dirname', 'artifacts'),
-    )
-    ledger = JsonCommitmentLedger(
-        round_log_dir,
-        ledger_filename=cfg.get('commitment_ledger_filename', 'commitment_ledger.json'),
-    )
-    return CommitmentService(artifact_store, ledger, cfg)
+        raise ValueError(f'Unsupported commitment_backend: {commitment_backend}')
+    return create_commitment_service_from_cfg(cfg)
 
 
 def bootstrap_commitment_backend(commitment_backend, initial_state_dict):
