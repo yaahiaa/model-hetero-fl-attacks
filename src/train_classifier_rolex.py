@@ -35,6 +35,7 @@ from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from torchvision import transforms
 import round_log as round_log_module
+from commitment_architecture import CommitmentService, JsonCommitmentLedger, LocalArtifactStore, VerificationReport
 from round_log import TransparencyLog, hash_state_dict
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -75,6 +76,13 @@ parser.add_argument('--attack_blocked_zero_metrics', default=None, type=str_to_b
 parser.add_argument('--recovered_pearson_threshold', default=None, type=float)
 parser.add_argument('--convergence_mode', default=None, type=str_to_bool)
 parser.add_argument('--disable_attack_for_convergence', default=None, type=str_to_bool)
+parser.add_argument('--commitment_backend', default=None, type=str)
+parser.add_argument('--artifact_store_backend', default=None, type=str)
+parser.add_argument('--ledger_backend', default=None, type=str)
+parser.add_argument('--commitment_architecture_enabled', default=None, type=str_to_bool)
+parser.add_argument('--commitment_artifact_dirname', default=None, type=str)
+parser.add_argument('--commitment_ledger_filename', default=None, type=str)
+parser.add_argument('--commitment_quorum_rule', default=None, type=str)
 args = vars(parser.parse_args())
 for k in cfg:
     cfg[k] = args[k]
@@ -125,6 +133,13 @@ cfg.setdefault('attack_blocked_zero_metrics', True)
 cfg.setdefault('recovered_pearson_threshold', 0.98)
 cfg.setdefault('convergence_mode', False)
 cfg.setdefault('disable_attack_for_convergence', False)
+cfg.setdefault('commitment_backend', 'local')
+cfg.setdefault('artifact_store_backend', 'local')
+cfg.setdefault('ledger_backend', 'json')
+cfg.setdefault('commitment_architecture_enabled', True)
+cfg.setdefault('commitment_artifact_dirname', 'artifacts')
+cfg.setdefault('commitment_ledger_filename', 'commitment_ledger.json')
+cfg.setdefault('commitment_quorum_rule', 'majority')
 if args['seed'] is not None:
     cfg['init_seed'] = int(args['seed'])
     cfg['num_experiments'] = 1
@@ -152,6 +167,20 @@ if args['convergence_mode'] is not None:
     cfg['convergence_mode'] = args['convergence_mode']
 if args['disable_attack_for_convergence'] is not None:
     cfg['disable_attack_for_convergence'] = args['disable_attack_for_convergence']
+if args['commitment_backend'] is not None:
+    cfg['commitment_backend'] = args['commitment_backend']
+if args['artifact_store_backend'] is not None:
+    cfg['artifact_store_backend'] = args['artifact_store_backend']
+if args['ledger_backend'] is not None:
+    cfg['ledger_backend'] = args['ledger_backend']
+if args['commitment_architecture_enabled'] is not None:
+    cfg['commitment_architecture_enabled'] = args['commitment_architecture_enabled']
+if args['commitment_artifact_dirname'] is not None:
+    cfg['commitment_artifact_dirname'] = args['commitment_artifact_dirname']
+if args['commitment_ledger_filename'] is not None:
+    cfg['commitment_ledger_filename'] = args['commitment_ledger_filename']
+if args['commitment_quorum_rule'] is not None:
+    cfg['commitment_quorum_rule'] = args['commitment_quorum_rule']
 
 
 def safe_cfg_get(*keys, default=''):
@@ -332,6 +361,72 @@ def apply_runtime_overrides():
         cfg['batch_size']['train'] = int(args['train_batch_size'])
     if args['test_batch_size'] is not None:
         cfg['batch_size']['test'] = int(args['test_batch_size'])
+
+
+def commitment_architecture_enabled():
+    return bool(cfg.get('commitment_architecture_enabled', True))
+
+
+def resolve_commitment_quorum_rule():
+    configured_rule = str(cfg.get('commitment_quorum_rule', 'majority'))
+    if args.get('commitment_quorum_rule') is not None:
+        return configured_rule
+    if configured_rule != 'majority':
+        return configured_rule
+    if str(cfg.get('experiment_method', '')).lower() == 'committee':
+        return 'committee_unanimous'
+    return configured_rule
+
+
+def create_commitment_backend():
+    round_log_dir = cfg.get('round_log_dir') or os.path.join('output', 'round_log', 'prototype2')
+
+    if not commitment_architecture_enabled():
+        return TransparencyLog(round_log_dir)
+
+    artifact_backend = str(cfg.get('artifact_store_backend', 'local')).lower()
+    ledger_backend = str(cfg.get('ledger_backend', 'json')).lower()
+    commitment_backend = str(cfg.get('commitment_backend', 'local')).lower()
+
+    if commitment_backend != 'local':
+        raise ValueError(f'Unsupported commitment_backend for Phase 1: {commitment_backend}')
+    if artifact_backend != 'local':
+        raise ValueError(f'Unsupported artifact_store_backend for Phase 1: {artifact_backend}')
+    if ledger_backend != 'json':
+        raise ValueError(f'Unsupported ledger_backend for Phase 1: {ledger_backend}')
+
+    artifact_store = LocalArtifactStore(
+        round_log_dir,
+        artifact_dirname=cfg.get('commitment_artifact_dirname', 'artifacts'),
+    )
+    ledger = JsonCommitmentLedger(
+        round_log_dir,
+        ledger_filename=cfg.get('commitment_ledger_filename', 'commitment_ledger.json'),
+    )
+    return CommitmentService(artifact_store, ledger, cfg)
+
+
+def bootstrap_commitment_backend(commitment_backend, initial_state_dict):
+    if isinstance(commitment_backend, CommitmentService):
+        return commitment_backend.ensure_genesis_parent(
+            initial_state_dict,
+            metadata={
+                'source': 'bootstrap',
+                'parent_for_round': 1,
+            },
+        )
+    return commitment_backend.bootstrap_initial_parent(initial_state_dict, parent_for_round=1)
+
+
+def fetch_latest_approved_parent(commitment_backend):
+    if isinstance(commitment_backend, CommitmentService):
+        parent_record = commitment_backend.get_latest_approved_parent()
+        parent_state = commitment_backend.get_latest_approved_parent_state()
+        return parent_record, parent_state
+
+    parent_record = commitment_backend.get_latest_approved_parent()
+    parent_state = commitment_backend.load_parent_state_dict(parent_record)
+    return parent_record, parent_state
 
 
 full_path = os.getcwd() + "/" + cfg['file_output']
@@ -634,6 +729,293 @@ def select_verifiers(local, user_idx, federation):
 
 
 def verify_and_commit_candidate_parent(
+    commitment_backend,
+    epoch,
+    candidate_state_dict,
+    local,
+    user_idx,
+    federation,
+    label_split,
+    logger,
+    candidate_meta=None,
+):
+    if isinstance(commitment_backend, CommitmentService):
+        return verify_and_commit_candidate_parent_via_service(
+            commitment_backend,
+            epoch,
+            candidate_state_dict,
+            local,
+            user_idx,
+            federation,
+            label_split,
+            logger,
+            candidate_meta=candidate_meta,
+        )
+
+    return verify_and_commit_candidate_parent_legacy(
+        commitment_backend,
+        epoch,
+        candidate_state_dict,
+        local,
+        user_idx,
+        federation,
+        label_split,
+        logger,
+        candidate_meta=candidate_meta,
+    )
+
+
+def verify_and_commit_candidate_parent_via_service(
+    commitment_service,
+    epoch,
+    candidate_state_dict,
+    local,
+    user_idx,
+    federation,
+    label_split,
+    logger,
+    candidate_meta=None,
+):
+    round_id = int(epoch) + 1
+    previous_parent_record, previous_parent_state = commitment_service.fetch_previous_approved_parent()
+    if previous_parent_record is None or previous_parent_state is None:
+        raise RuntimeError('No approved parent is available for committee verification')
+
+    committee = select_verifiers(local, user_idx, federation)
+    committee_ids = [int(verifier_user_id) for _, verifier_user_id, _ in committee]
+    active_cohorts = sorted({float(federation.model_rate[uid]) for uid in user_idx})
+    active_user_model_rates = {
+        int(uid): float(federation.model_rate[uid]) for uid in user_idx
+    }
+    candidate_metadata = dict(candidate_meta or {})
+    candidate_metadata.update({
+        'active_users': [int(uid) for uid in user_idx],
+        'active_user_model_rates': active_user_model_rates,
+        'required_cohort_rates': active_cohorts,
+    })
+
+    candidate_record, candidate_submission_id = commitment_service.submit_candidate_parent(
+        round_id=round_id,
+        candidate_state_dict=copy.deepcopy(candidate_state_dict),
+        previous_parent_hash=previous_parent_record.parent_hash,
+        schedule_id=str(candidate_metadata.get('candidate_source', f'round-{round_id}')),
+        active_cohorts=active_cohorts,
+        committee_ids=committee_ids,
+        metadata=candidate_metadata,
+    )
+    candidate_record, fetched_candidate_state = commitment_service.fetch_candidate_parent(round_id)
+
+    if candidate_record.previous_parent_hash != previous_parent_record.parent_hash:
+        raise RuntimeError(
+            f'Ledger candidate previous_parent_hash mismatch: '
+            f'expected={previous_parent_record.parent_hash} '
+            f'observed={candidate_record.previous_parent_hash}'
+        )
+
+    verifier_reports = []
+
+    if cfg.get('debug_commitment', False):
+        committee_desc = [
+            f'(slot={slot}, user={verifier_user_id}, rate={float(verifier_local.model_rate)})'
+            for slot, verifier_user_id, verifier_local in committee
+        ]
+        logger.append({
+            'info': [
+                f'[COMMIT] target_parent_round={round_id}',
+                f'[COMMIT] candidate_source={candidate_meta.get("candidate_source", "unknown") if candidate_meta else "unknown"}',
+                f'[COMMIT] committee={committee_desc}',
+                f'[COMMIT] previous_parent_hash={previous_parent_record.parent_hash}',
+                f'[COMMIT] candidate_hash={candidate_record.candidate_parent_hash}',
+                f'[COMMIT] artifact_cid={candidate_record.candidate_artifact.cid}',
+                f'[COMMIT] artifact_sha256={candidate_record.candidate_artifact.sha256}',
+                f'[COMMIT] artifact_size_bytes={candidate_record.candidate_artifact.size_bytes}',
+                f'[COMMIT] ledger_candidate_submission={candidate_submission_id}',
+            ]
+        }, 'train', mean=False)
+
+    for _, verifier_user_id, verifier_local in committee:
+        prev_federation = Federation(
+            round_id,
+            copy.deepcopy(previous_parent_state),
+            cfg['model_rate'],
+            label_split
+        )
+
+        cand_federation = Federation(
+            round_id,
+            copy.deepcopy(fetched_candidate_state),
+            cfg['model_rate'],
+            label_split
+        )
+
+        prev_local_parameters, _ = prev_federation.extract_honest_local_parameters([verifier_user_id])
+        cand_local_parameters, _ = cand_federation.extract_honest_local_parameters([verifier_user_id])
+
+        prev_local_parameters = prev_local_parameters[0]
+        cand_local_parameters = cand_local_parameters[0]
+
+        prev_eval = evaluate_local_parameters(
+            prev_local_parameters,
+            prev_federation.model_rate[verifier_user_id],
+            verifier_local.data_loader,
+            verifier_local.label_split,
+            max_steps=cfg['verifier_val_size'],
+        )
+
+        cand_eval = evaluate_local_parameters(
+            cand_local_parameters,
+            cand_federation.model_rate[verifier_user_id],
+            verifier_local.data_loader,
+            verifier_local.label_split,
+            max_steps=cfg['verifier_val_size'],
+        )
+
+        rel_change = relative_model_change(prev_local_parameters, cand_local_parameters)
+        cohort_rate = float(cand_federation.model_rate[verifier_user_id])
+        approved = True
+        reason = 'ok'
+
+        structure_checks_enabled = int(epoch) > int(cfg.get('verifier_structure_warmup_rounds', 2))
+        behavior_frozen, behavior_report = behavior_freeze_check(
+            prev_eval=prev_eval,
+            cand_eval=cand_eval,
+            rel_change=rel_change,
+        )
+
+        if cand_eval['Local-Loss'] > prev_eval['Local-Loss'] + cfg['verifier_max_loss_increase']:
+            approved = False
+            reason = 'validation loss increased too much'
+        elif cand_eval['Local-Accuracy'] + cfg['verifier_max_acc_drop'] < prev_eval['Local-Accuracy']:
+            approved = False
+            reason = 'validation accuracy dropped too much'
+        elif structure_checks_enabled and rel_change < cfg['verifier_min_relative_change']:
+            approved = False
+            reason = 'candidate too similar to previous approved parent'
+        elif structure_checks_enabled and rel_change > cfg['verifier_max_relative_change']:
+            approved = False
+            reason = 'candidate too different from previous approved parent'
+        elif structure_checks_enabled and behavior_frozen:
+            approved = False
+            reason = 'candidate has parameter drift but frozen verifier behavior'
+
+        report_metrics = {
+            'structure_checks_enabled': structure_checks_enabled,
+            'verifier_min_relative_change': float(cfg['verifier_min_relative_change']),
+            'verifier_max_relative_change': float(cfg['verifier_max_relative_change']),
+            **behavior_report,
+        }
+        report_record = VerificationReport(
+            round_id=round_id,
+            verifier_user_id=int(verifier_user_id),
+            cohort_rate=cohort_rate,
+            approved=approved,
+            reason=reason,
+            relative_change=rel_change,
+            prev_eval=prev_eval,
+            cand_eval=cand_eval,
+            metrics=report_metrics,
+            timestamp=time.time(),
+        )
+        report_submission_id = commitment_service.submit_verification_report(report_record)
+        report = {
+            'user_id': int(verifier_user_id),
+            'cohort_rate': cohort_rate,
+            'approved': approved,
+            'reason': reason,
+            'prev_eval': prev_eval,
+            'cand_eval': cand_eval,
+            'relative_change': rel_change,
+            **report_metrics,
+            'report_submission_id': report_submission_id,
+        }
+        verifier_reports.append(report)
+
+        if cfg.get('debug_commitment', False):
+            logger.append({
+                'info': [
+                    f'[COMMIT][Verifier {verifier_user_id}] cohort_rate={cohort_rate}',
+                    f'[COMMIT][Verifier {verifier_user_id}] approved={approved}',
+                    f'[COMMIT][Verifier {verifier_user_id}] reason={reason}',
+                    f'[COMMIT][Verifier {verifier_user_id}] prev_loss={prev_eval["Local-Loss"]:.6f}',
+                    f'[COMMIT][Verifier {verifier_user_id}] cand_loss={cand_eval["Local-Loss"]:.6f}',
+                    f'[COMMIT][Verifier {verifier_user_id}] prev_acc={prev_eval["Local-Accuracy"]:.6f}',
+                    f'[COMMIT][Verifier {verifier_user_id}] cand_acc={cand_eval["Local-Accuracy"]:.6f}',
+                    f'[COMMIT][Verifier {verifier_user_id}] rel_change={rel_change:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] structure_checks_enabled={structure_checks_enabled}',
+                    f'[COMMIT][Verifier {verifier_user_id}] min_rel_change={cfg["verifier_min_relative_change"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] max_rel_change={cfg["verifier_max_relative_change"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] behavior_loss_delta={behavior_report["behavior_loss_delta"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] behavior_acc_delta={behavior_report["behavior_acc_delta"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] behavior_frozen={behavior_report["behavior_frozen"]}',
+                    f'[COMMIT][Verifier {verifier_user_id}] min_behavior_loss_delta={behavior_report["verifier_min_behavior_loss_delta"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] min_behavior_acc_delta={behavior_report["verifier_min_behavior_acc_delta"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] behavior_freeze_max_rel={behavior_report["verifier_behavior_freeze_max_relative_change"]:.6e}',
+                    f'[COMMIT][Verifier {verifier_user_id}] ledger_report_submission={report_submission_id}',
+                ]
+            }, 'train', mean=False)
+
+    decision = commitment_service.finalize_round(
+        round_id,
+        quorum_rule=resolve_commitment_quorum_rule(),
+    )
+    latest_approved_parent = commitment_service.get_latest_approved_parent()
+    required = sorted({float(r['cohort_rate']) for r in verifier_reports})
+    approved_cohorts = sorted({float(r['cohort_rate']) for r in verifier_reports if r.get('approved', False)})
+    event = {
+        'event_type': 'approved_parent' if decision.approved else 'candidate_parent',
+        'round_produced': int(epoch),
+        'parent_for_round': round_id,
+        'model_hash': candidate_record.candidate_parent_hash,
+        'artifact_ref': {
+            'cid': candidate_record.candidate_artifact.cid,
+            'uri': candidate_record.candidate_artifact.uri,
+            'sha256': candidate_record.candidate_artifact.sha256,
+            'size_bytes': candidate_record.candidate_artifact.size_bytes,
+            'encrypted': candidate_record.candidate_artifact.encrypted,
+            'encryption_alg': candidate_record.candidate_artifact.encryption_alg,
+        },
+        'active_users': [int(u) for u in user_idx],
+        'active_user_model_rates': {str(int(k)): float(v) for k, v in active_user_model_rates.items()},
+        'required_cohort_rates': required,
+        'approved_cohort_rates': approved_cohorts,
+        'verifier_reports': verifier_reports,
+        'approved': bool(decision.approved),
+        'timestamp': int(decision.timestamp),
+        'candidate_metadata': candidate_metadata,
+        'commitment_id': candidate_submission_id,
+        'quorum_decision_reason': decision.reason,
+        'quorum_rule': decision.quorum_rule,
+        'decision_num_approved': int(decision.num_approved),
+        'decision_num_rejected': int(decision.num_rejected),
+        'latest_approved_parent_hash': latest_approved_parent.parent_hash if latest_approved_parent else None,
+    }
+
+    logger.append({
+        'info': [
+            f'Prototype-2 commitment check for round {round_id}',
+            f'candidate source: {candidate_meta.get("candidate_source", "unknown") if candidate_meta else "unknown"}',
+            f'commitment approved: {event["approved"]}',
+            f'approved cohorts: {event["approved_cohort_rates"]}',
+            f'required cohorts: {event["required_cohort_rates"]}',
+            f'candidate hash: {event["model_hash"]}',
+        ]
+    }, 'train', mean=False)
+
+    if cfg.get('debug_commitment', False):
+        logger.append({
+            'info': [
+                f'[COMMIT] quorum_rule={decision.quorum_rule}',
+                f'[COMMIT] quorum_decision_reason={decision.reason}',
+                f'[COMMIT] num_approved={decision.num_approved}',
+                f'[COMMIT] num_rejected={decision.num_rejected}',
+                f'[COMMIT] latest_approved_parent_hash={event["latest_approved_parent_hash"]}',
+            ]
+        }, 'train', mean=False)
+
+    return event
+
+
+def verify_and_commit_candidate_parent_legacy(
     round_log_module,
     epoch,
     candidate_state_dict,
@@ -866,8 +1248,8 @@ def runExperiment():
         data_split, label_split = split_dataset(dataset, cfg['num_users'], cfg['data_split_mode'])
     global_parameters = model.state_dict()
 
-    round_log_module = TransparencyLog(cfg['round_log_dir'])
-    round_log_module.bootstrap_initial_parent(global_parameters, parent_for_round=1)
+    commitment_backend = create_commitment_backend()
+    bootstrap_commitment_backend(commitment_backend, global_parameters)
 
     model_history_block2 = {}
     model_history_block2['blocks.2.weight'] = []
@@ -897,8 +1279,7 @@ def runExperiment():
         epoch_start = now_seconds()
         logger.safe(True)
 
-        approved_parent_record = round_log_module.get_latest_approved_parent()
-        approved_parent_state = round_log_module.load_parent_state_dict(approved_parent_record)
+        approved_parent_record, approved_parent_state = fetch_latest_approved_parent(commitment_backend)
         approved_parent_state = move_state_dict_to_device(approved_parent_state, cfg['device'])
         global_parameters = copy.deepcopy(approved_parent_state)
 
@@ -915,7 +1296,7 @@ def runExperiment():
             optimizer,
             logger,
             epoch,
-            round_log_module,
+            commitment_backend,
             runtime_control,
             experiment_tracker
         )
@@ -1019,7 +1400,7 @@ def runExperiment():
     return
 
 
-def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, transparency_log, runtime_control, experiment_tracker):
+def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, data_split, label_split, federation, global_model, optimizer, logger, epoch, commitment_backend, runtime_control, experiment_tracker):
     global_model.load_state_dict(federation.global_parameters)
     attack_enabled = attack_execution_enabled()
     attack_round = attack_enabled and int(epoch) in {
@@ -1070,7 +1451,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
         }
 
     global_model.train(True)
-    local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, transparency_log, logger)
+    local, local_parameters, user_idx, param_idx = make_local(dataset, data_split, label_split, federation, commitment_backend, logger)
     distributed_local_parameters = copy.deepcopy(local_parameters)
     num_active_users = len(local)
 
@@ -1120,7 +1501,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
 
     committee_timer_start = now_seconds()
     commitment_event = verify_and_commit_candidate_parent(
-        transparency_log,
+        commitment_backend,
         epoch,
         copy.deepcopy(candidate_parent_state),
         local,
@@ -1172,9 +1553,9 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
                 'candidate_source': 'honest_fallback_after_reject',
                 'round_produced': int(epoch),
                 'target_parent_round': int(epoch) + 1,
-                'previous_parent_hash': transparency_log.hash_state_dict(federation.initial_parent_state),
-                'honest_aggregated_hash': transparency_log.hash_state_dict(honest_aggregated_state),
-                'candidate_hash': transparency_log.hash_state_dict(honest_aggregated_state),
+                'previous_parent_hash': hash_state_dict(federation.initial_parent_state),
+                'honest_aggregated_hash': hash_state_dict(honest_aggregated_state),
+                'candidate_hash': hash_state_dict(honest_aggregated_state),
                 'relative_change_vs_previous_parent': state_dict_relative_l2(
                     federation.initial_parent_state, honest_aggregated_state
                 ),
@@ -1189,7 +1570,7 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
 
             fallback_committee_timer_start = now_seconds()
             fallback_event = verify_and_commit_candidate_parent(
-                transparency_log,
+                commitment_backend,
                 epoch,
                 copy.deepcopy(honest_aggregated_state),
                 local,
@@ -1204,16 +1585,14 @@ def train(model_history_block2, model_history_fcnn,fcnn_attack_cache, dataset, d
             if fallback_event['approved']:
                 final_parent_state = clone_state_dict(honest_aggregated_state)
             else:
-                approved_parent_record = transparency_log.get_latest_approved_parent()
-                rollback_state = transparency_log.load_parent_state_dict(approved_parent_record)
+                approved_parent_record, rollback_state = fetch_latest_approved_parent(commitment_backend)
                 rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
                 final_parent_state = clone_state_dict(rollback_state)
                 round_was_skipped = True
                 round_skip_reason = 'fallback_honest_rejected'
 
         elif rejection_response == 'rollback_previous':
-            approved_parent_record = transparency_log.get_latest_approved_parent()
-            rollback_state = transparency_log.load_parent_state_dict(approved_parent_record)
+            approved_parent_record, rollback_state = fetch_latest_approved_parent(commitment_backend)
             rollback_state = move_state_dict_to_device(rollback_state, cfg['device'])
 
             runtime_control['skip_next_epoch'] = True
@@ -1623,7 +2002,7 @@ def cast_local_parameters_to_reference(local_parameters, expected_local_paramete
                 fixed[m][k] = local_parameters[m][k]
     return fixed
 
-def make_local(dataset, data_split, label_split, federation, round_log_module, logger):
+def make_local(dataset, data_split, label_split, federation, commitment_backend, logger):
     num_active_users = int(np.ceil(cfg['frac'] * cfg['num_users']))
     user_idx = torch.arange(cfg['num_users'])[torch.randperm(cfg['num_users'])[:num_active_users]].tolist()
 
