@@ -59,10 +59,12 @@ round_log_dir: output/round_log/prototype2
 validation_response: zero_change
 verifier_val_size : 32
 verifier_max_loss_increase : 0.05
-verifier_max_acc_drop : 5.0
-verifier_min_relative_change : 0.1
+verifier_max_acc_drop : 10.0
+verifier_min_relative_change : 0.005
 verifier_max_relative_change : 0.6
-verifier_behavior_freeze_min_relative_change : 0.04
+verifier_min_behavior_loss_delta : 0.0003
+verifier_min_behavior_acc_delta : 1.0e-9
+verifier_behavior_freeze_min_relative_change : 0.02
 verifier_structure_warmup_rounds : 2
 
 # replay-commit attack / prototype-2 debug

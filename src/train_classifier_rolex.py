@@ -99,16 +99,16 @@ cfg.setdefault('verifier_val_size', 32)
 cfg.setdefault('verifier_max_loss_increase', 0.05)
 cfg.setdefault('verifier_max_acc_drop', 10.0)
 # Lower bound: reject near-exact replay
-cfg.setdefault('verifier_min_relative_change', 0.02)
+cfg.setdefault('verifier_min_relative_change', 0.005)
 # Upper bound: reject candidates that move too far from the previous approved parent
 cfg.setdefault('verifier_max_relative_change', 0.6)
 # Warmup: do not apply structural drift bounds during the first few rounds
 cfg.setdefault('verifier_structure_warmup_rounds', 2)
 cfg.setdefault('verifier_behavior_freeze_enabled', True)
 # Minimum behavior movement expected when the model parameters changed.
-cfg.setdefault('verifier_min_behavior_loss_delta', 0.001)
+cfg.setdefault('verifier_min_behavior_loss_delta', 0.0003)
 cfg.setdefault('verifier_min_behavior_acc_delta', 1.0e-9)
-cfg.setdefault('verifier_behavior_freeze_min_relative_change', 0.04)
+cfg.setdefault('verifier_behavior_freeze_min_relative_change', 0.02)
 # Only apply the freeze detector in the low/mid drift region.
 cfg.setdefault('verifier_behavior_freeze_max_relative_change', 0.20)
 cfg.setdefault('attack_model_mode', 'hybrid_trap')
