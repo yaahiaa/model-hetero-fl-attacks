@@ -5,9 +5,20 @@ from config import cfg
 from collections import OrderedDict
 
 
+def _clone_state_dict(state_dict):
+    cloned = OrderedDict()
+    for key, value in state_dict.items():
+        if torch.is_tensor(value):
+            cloned[key] = value.detach().clone()
+        else:
+            cloned[key] = copy.deepcopy(value)
+    return cloned
+
+
 class Federation:
     def __init__(self, epoch, distributed_params, global_parameters, rate, label_split):
         self.global_parameters = global_parameters
+        self.initial_parent_state = _clone_state_dict(global_parameters)
         self.rate = rate
         self.label_split = label_split
         self.make_model_rate()
@@ -205,66 +216,79 @@ class Federation:
             raise ValueError('Not valid model name')
         return idx
 
-    def distribute(self, user_idx):
-        self.make_model_rate()
-        param_idx = self.split_model(user_idx)
+    def _extract_from_param_idx(self, user_idx, param_idx):
         local_parameters = [OrderedDict() for _ in range(len(user_idx))]
         for k, v in self.global_parameters.items():
             parameter_type = k.split('.')[-1]
             for m in range(len(user_idx)):
                 if 'weight' in parameter_type or 'bias' in parameter_type:
                     if 'weight' in parameter_type:
-                        if (self.model_rate[user_idx[m]] == 1.0 and k == 'blocks.0.weight'):
-                            v = v.new_zeros(v.size(), dtype=torch.float32)
-                            for i in range(v.size()[0]):
-                                v[i][0][1][1] = 1
-                            print(" Conv. Filter New = %s"%(v), flush=True)
-
-
-
                         if v.dim() > 1:
                             local_parameters[m][k] = copy.deepcopy(v[torch.meshgrid(param_idx[m][k])])
                         else:
-                            local_parameters[m][k] = copy.deepcopy(v[param_idx[m][k]]) # Extracting the sub-parameters for a layer. 
+                            local_parameters[m][k] = copy.deepcopy(v[param_idx[m][k]])
                     else:
                         local_parameters[m][k] = copy.deepcopy(v[param_idx[m][k]])
-
-                    if self.model_rate[user_idx[m]] == 0.5 and self.rd == cfg['num_epochs']['global']:
-                        print(": self.rd = %s and global epochs = %s"%(self.rd, cfg['num_epochs']['global']))
-                        if k == 'layers.0.weight': # Need to do torch cat. 
-                            updated_size = (int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2, v.size()[1])
-                            weights = self.initialize_weights(updated_size, k)
-                            weights_concat = np.concatenate((weights, weights)) # By default, axis is 0. 
-                            self.model_to_distribute[k] = torch.from_numpy(weights_concat)
-                            print(" DISTRIBUTE: For key %s local_params lower = %s"%(k, self.model_to_distribute[k][:5]))
-                            print(" DISTRIBUTE: For key %s local_params upper = %s"%(k, self.model_to_distribute[k][(int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2) : (int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2) + 5]))
-
-                        elif k == 'layers.2.weight': # Need to do torch cat along other dimension. 
-                            updated_size = (v.size()[0], int(np.ceil(v.size()[1] * self.model_rate[user_idx[m]])) // 2)
-                            weights = self.initialize_weights(updated_size, k)
-                            weights_concat = np.concatenate((weights, weights), axis=1)
-                            self.model_to_distribute[k] = torch.from_numpy(weights_concat)
-
-                            print(" DISTRIBUTE: For key %s local_params lower = %s"%(k, self.model_to_distribute[k][:, :5]))
-                            print(" DISTRIBUTE: For key %s local_params upper = %s"%(k, self.model_to_distribute[k][:, (int(np.ceil(v.size()[1] * self.model_rate[user_idx[m]])) // 2) : (int(np.ceil(v.size()[1] * self.model_rate[user_idx[m]])) // 2) + 5]))
-
-                        elif k == 'layers.0.bias': # Need to do torch cat. 
-                            biases = self.initialize_biases(int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2, k)
-                            biases_concat = np.concatenate((biases, biases))
-                            self.model_to_distribute[k] = torch.from_numpy(biases_concat)
-
-                            print(" DISTRIBUTE: For key %s local_params lower = %s"%(k, self.model_to_distribute[k][:5]))
-                            print(" DISTRIBUTE: For key %s local_params upper = %s"%(k, self.model_to_distribute[k][(int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2) : (int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2) + 5]))
-
-                        elif k == 'layers.2.bias': # No need for torch cat. 
-                            updated_size = v.size()[0]
-                            biases = self.initialize_biases(updated_size, k)
-                            self.model_to_distribute[k] = torch.from_numpy(biases)
-                        # In any case: 
-                        print("For user 0.5, self.model_to_distribute[k] first 5 elems = %s"%(self.model_to_distribute[k][:5]))
-                        local_parameters[m][k] = self.model_to_distribute[k]
                 else:
                     local_parameters[m][k] = copy.deepcopy(v)
+        return local_parameters
+
+    def extract_honest_local_parameters(self, user_idx, param_idx=None):
+        if param_idx is None:
+            param_idx = self.split_model(user_idx)
+        local_parameters = self._extract_from_param_idx(user_idx, param_idx)
+        return local_parameters, param_idx
+
+    def distribute(self, user_idx):
+        self.make_model_rate()
+        param_idx = self.split_model(user_idx)
+        local_parameters = self._extract_from_param_idx(user_idx, param_idx)
+        for k, v in self.global_parameters.items():
+            parameter_type = k.split('.')[-1]
+            if 'weight' not in parameter_type and 'bias' not in parameter_type:
+                continue
+            for m in range(len(user_idx)):
+                if parameter_type == 'weight' and self.model_rate[user_idx[m]] == 1.0 and k == 'blocks.0.weight':
+                    modified = v.new_zeros(v.size(), dtype=torch.float32)
+                    for i in range(modified.size()[0]):
+                        modified[i][0][1][1] = 1
+                    print(" Conv. Filter New = %s"%(modified), flush=True)
+                    local_parameters[m][k] = copy.deepcopy(modified[torch.meshgrid(param_idx[m][k])])
+
+                if self.model_rate[user_idx[m]] == 0.5 and self.rd == cfg['num_epochs']['global']:
+                    print(": self.rd = %s and global epochs = %s"%(self.rd, cfg['num_epochs']['global']))
+                    if k == 'layers.0.weight': # Need to do torch cat. 
+                        updated_size = (int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2, v.size()[1])
+                        weights = self.initialize_weights(updated_size, k)
+                        weights_concat = np.concatenate((weights, weights)) # By default, axis is 0. 
+                        self.model_to_distribute[k] = torch.from_numpy(weights_concat)
+                        print(" DISTRIBUTE: For key %s local_params lower = %s"%(k, self.model_to_distribute[k][:5]))
+                        print(" DISTRIBUTE: For key %s local_params upper = %s"%(k, self.model_to_distribute[k][(int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2) : (int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2) + 5]))
+
+                    elif k == 'layers.2.weight': # Need to do torch cat along other dimension. 
+                        updated_size = (v.size()[0], int(np.ceil(v.size()[1] * self.model_rate[user_idx[m]])) // 2)
+                        weights = self.initialize_weights(updated_size, k)
+                        weights_concat = np.concatenate((weights, weights), axis=1)
+                        self.model_to_distribute[k] = torch.from_numpy(weights_concat)
+
+                        print(" DISTRIBUTE: For key %s local_params lower = %s"%(k, self.model_to_distribute[k][:, :5]))
+                        print(" DISTRIBUTE: For key %s local_params upper = %s"%(k, self.model_to_distribute[k][:, (int(np.ceil(v.size()[1] * self.model_rate[user_idx[m]])) // 2) : (int(np.ceil(v.size()[1] * self.model_rate[user_idx[m]])) // 2) + 5]))
+
+                    elif k == 'layers.0.bias': # Need to do torch cat. 
+                        biases = self.initialize_biases(int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2, k)
+                        biases_concat = np.concatenate((biases, biases))
+                        self.model_to_distribute[k] = torch.from_numpy(biases_concat)
+
+                        print(" DISTRIBUTE: For key %s local_params lower = %s"%(k, self.model_to_distribute[k][:5]))
+                        print(" DISTRIBUTE: For key %s local_params upper = %s"%(k, self.model_to_distribute[k][(int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2) : (int(np.ceil(v.size()[0] * self.model_rate[user_idx[m]])) // 2) + 5]))
+
+                    elif k == 'layers.2.bias': # No need for torch cat. 
+                        updated_size = v.size()[0]
+                        biases = self.initialize_biases(updated_size, k)
+                        self.model_to_distribute[k] = torch.from_numpy(biases)
+                    # In any case: 
+                    print("For user 0.5, self.model_to_distribute[k] first 5 elems = %s"%(self.model_to_distribute[k][:5]))
+                    local_parameters[m][k] = self.model_to_distribute[k]
                 
         # local_parameters: An array indexed by user_idx, which maps a key (e.g. blocks.weight.0 to its corresponding value (subset of global value))
         # param_idx: What is returned from split model (i.e. the indeces of which parameters to keep for a given layer). 
@@ -479,3 +503,22 @@ class Federation:
             raise ValueError('Not valid model name')
 
         return
+
+
+def extract_honest_static_submodel_from_parent(parent_parameters, model_rate, user_id, cfg_override=None):
+    effective_cfg = cfg if cfg_override is None else cfg_override
+    num_users = int(effective_cfg.get('num_users', max(int(user_id) + 1, 1)))
+    rate_template = list(effective_cfg.get('model_rate', [float(model_rate)] * num_users))
+    if len(rate_template) < num_users:
+        rate_template.extend([float(model_rate)] * (num_users - len(rate_template)))
+
+    federation = Federation(
+        epoch=0,
+        distributed_params=OrderedDict(),
+        global_parameters=_clone_state_dict(parent_parameters),
+        rate=rate_template,
+        label_split={},
+    )
+    federation.model_rate[int(user_id)] = float(model_rate)
+    local_parameters, _ = federation.extract_honest_local_parameters([int(user_id)])
+    return local_parameters[0]
