@@ -99,7 +99,7 @@ cfg.setdefault('verifier_val_size', 32)
 cfg.setdefault('verifier_max_loss_increase', 0.05)
 cfg.setdefault('verifier_max_acc_drop', 10.0)
 # Lower bound: reject near-exact replay
-cfg.setdefault('verifier_min_relative_change', 0.005)
+cfg.setdefault('verifier_min_relative_change', 1.0e-5)
 # Upper bound: reject candidates that move too far from the previous approved parent
 cfg.setdefault('verifier_max_relative_change', 0.6)
 # Warmup: do not apply structural drift bounds during the first few rounds
