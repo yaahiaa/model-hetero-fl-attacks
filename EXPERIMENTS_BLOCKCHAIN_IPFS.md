@@ -54,6 +54,17 @@ python scripts/check_blockchain_ipfs_backends.py \
 
 If either service is unavailable, the script reports the failing URL and the missing service.
 
+Expected success output includes:
+
+```text
+IPFS add/cat OK
+Blockchain RPC OK
+Contract compiled OK
+Contract deployed at <address>
+```
+
+The Solidity contract is compiled with `solc 0.8.24`, optimizer enabled, `optimize_runs=200`, and `viaIR=true`. The `viaIR` setting is required because default Solidity compilation can hit a "Stack too deep" error for the commitment contract.
+
 ## Smoke Test
 
 ```bash

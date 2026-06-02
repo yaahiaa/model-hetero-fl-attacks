@@ -3,6 +3,19 @@ import sys
 import time
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / 'src'
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from blockchain_compile import (
+    SOLC_OPTIMIZE,
+    SOLC_OPTIMIZE_RUNS,
+    SOLC_VERSION,
+    SOLC_VIA_IR,
+    compile_commitment_ledger_contract,
+)
+
 
 def check_ipfs(api_url):
     try:
@@ -39,24 +52,13 @@ def check_ipfs(api_url):
 
 
 def compile_contract():
-    try:
-        import solcx
-    except ImportError as exc:
-        raise RuntimeError('Missing py-solc-x. Install with: pip install -r requirements-blockchain.txt') from exc
-
-    contract_path = Path(__file__).resolve().parents[1] / 'src' / 'contracts' / 'CommitmentLedger.sol'
-    try:
-        installed_versions = solcx.get_installed_solc_versions()
-        if installed_versions:
-            solcx.set_solc_version(str(installed_versions[-1]))
-        compiled = solcx.compile_files([str(contract_path)], output_values=['abi', 'bin'])
-    except Exception as exc:
-        raise RuntimeError(
-            f'Could not compile {contract_path}. Install solc 0.8.24 with '
-            '`python -c "import solcx; solcx.install_solc(\'0.8.24\')"`. Original error: {exc}'
-        ) from exc
-    key = next(k for k in compiled if k.endswith(':CommitmentLedger'))
-    return compiled[key]['abi'], compiled[key]['bin']
+    contract_path = SRC_DIR / 'contracts' / 'CommitmentLedger.sol'
+    print(f'Contract path: {contract_path}')
+    print(f'Solc version: {SOLC_VERSION}')
+    print(f'optimize={SOLC_OPTIMIZE} optimize_runs={SOLC_OPTIMIZE_RUNS} via_ir={SOLC_VIA_IR}')
+    abi, bytecode = compile_commitment_ledger_contract(contract_path)
+    print('Contract compiled OK')
+    return abi, bytecode
 
 
 def check_blockchain(rpc_url, chain_id, account_index, deploy_contract):
@@ -77,10 +79,11 @@ def check_blockchain(rpc_url, chain_id, account_index, deploy_contract):
     print(f'Accounts ({len(accounts)}): {accounts}')
     print(f'Latest block: {web3.eth.block_number}')
 
+    abi, bytecode = compile_contract()
+
     if deploy_contract:
         if account_index >= len(accounts):
             raise RuntimeError(f'Account index {account_index} unavailable; node returned {len(accounts)} accounts')
-        abi, bytecode = compile_contract()
         account = accounts[account_index]
         contract = web3.eth.contract(abi=abi, bytecode=bytecode)
         started = time.perf_counter()
@@ -90,9 +93,11 @@ def check_blockchain(rpc_url, chain_id, account_index, deploy_contract):
             'chainId': int(chain_id),
         })
         receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        if int(receipt.status) != 1:
+            raise RuntimeError(f'Contract deployment transaction failed: tx={tx_hash.hex()}')
         print(
-            'Contract deploy OK: '
-            f'address={receipt.contractAddress} tx={tx_hash.hex()} '
+            'Contract deployed at '
+            f'{receipt.contractAddress} tx={tx_hash.hex()} '
             f'block={receipt.blockNumber} gas_used={receipt.gasUsed} '
             f'latency_sec={time.perf_counter() - started:.3f}'
         )

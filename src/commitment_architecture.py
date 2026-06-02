@@ -13,6 +13,22 @@ from urllib.request import url2pathname
 
 import torch
 
+try:
+    from blockchain_compile import (
+        SOLC_OPTIMIZE,
+        SOLC_OPTIMIZE_RUNS,
+        SOLC_VERSION,
+        SOLC_VIA_IR,
+        compile_commitment_ledger_contract,
+    )
+except ImportError:
+    from .blockchain_compile import (
+        SOLC_OPTIMIZE,
+        SOLC_OPTIMIZE_RUNS,
+        SOLC_VERSION,
+        SOLC_VIA_IR,
+        compile_commitment_ledger_contract,
+    )
 from round_log import hash_state_dict
 
 
@@ -691,26 +707,14 @@ class EthereumCommitmentLedger(CommitmentLedger):
 
     def _load_contract_artifacts(self):
         contract_path = Path(__file__).resolve().parent / 'contracts' / 'CommitmentLedger.sol'
-        try:
-            import solcx
-        except ImportError as exc:
-            raise RuntimeError(
-                'Ethereum ledger backend requires py-solc-x. Install optional dependencies with: '
-                'pip install -r requirements-blockchain.txt'
-            ) from exc
-        try:
-            installed_versions = solcx.get_installed_solc_versions()
-            if installed_versions:
-                solcx.set_solc_version(str(installed_versions[-1]))
-            compiled = solcx.compile_files([str(contract_path)], output_values=['abi', 'bin'])
-        except Exception as exc:
-            raise RuntimeError(
-                f'Could not compile {contract_path}. Install a local solc version with '
-                '`python -c "import solcx; solcx.install_solc(\'0.8.24\')"`. '
-                f'Original error: {exc}'
-            ) from exc
-        contract_key = next(key for key in compiled if key.endswith(':CommitmentLedger'))
-        return compiled[contract_key]['abi'], compiled[contract_key]['bin']
+        print('[COMMIT][SOLC] contract path:', contract_path)
+        print('[COMMIT][SOLC] solc version:', SOLC_VERSION)
+        print('[COMMIT][SOLC] optimize:', SOLC_OPTIMIZE)
+        print('[COMMIT][SOLC] optimize_runs:', SOLC_OPTIMIZE_RUNS)
+        print('[COMMIT][SOLC] via_ir:', SOLC_VIA_IR)
+        abi, bytecode = compile_commitment_ledger_contract(contract_path)
+        print('[COMMIT][SOLC] Contract compiled OK')
+        return abi, bytecode
 
     def _tx_options(self) -> Dict[str, Any]:
         options = {
@@ -765,6 +769,7 @@ class EthereumCommitmentLedger(CommitmentLedger):
         return tx_hash_hex
 
     def _deploy_contract(self):
+        print('[COMMIT][ETH] deploying CommitmentLedger contract')
         contract_factory = self.web3.eth.contract(abi=self.abi, bytecode=self.bytecode)
         tx_hash = self._send_transaction(contract_factory.constructor(), 'contract_deployed', {})
         if not self.wait_for_receipt:
@@ -773,6 +778,12 @@ class EthereumCommitmentLedger(CommitmentLedger):
         address = receipt.get('contractAddress')
         if not address:
             raise RuntimeError(f'Contract deployment did not return an address for tx {tx_hash}')
+        print(
+            '[COMMIT][ETH] deployment succeeded: '
+            f'address={address} tx_hash={tx_hash} '
+            f'block_number={receipt.get("blockNumber")} gas_used={receipt.get("gasUsed")} '
+            f'receipt_wait_time_sec={self.last_metrics.get("receipt_wait_time_sec")}'
+        )
         return address, self.web3.eth.contract(address=address, abi=self.abi)
 
     def _append_event(self, event_type: str, payload: Dict[str, Any], record_id: str, tx_payload: Dict[str, Any]) -> None:
