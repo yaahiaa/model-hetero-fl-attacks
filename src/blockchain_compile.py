@@ -22,16 +22,36 @@ def compile_commitment_ledger_contract(contract_path: Path) -> Tuple[Any, str]:
     if not contract_path.exists():
         raise RuntimeError(f'Solidity contract not found: {contract_path}')
 
-    installed_versions = {str(version) for version in solcx.get_installed_solc_versions()}
-    if SOLC_VERSION not in installed_versions:
-        raise RuntimeError(
-            f'Solidity compiler {SOLC_VERSION} is not installed. Install it with: '
-            f'python -c "import solcx; solcx.install_solc(\'{SOLC_VERSION}\')"'
+    try:
+        installed_versions = {str(version) for version in solcx.get_installed_solc_versions()}
+
+        if SOLC_VERSION not in installed_versions:
+            print(
+                f'Solidity compiler {SOLC_VERSION} not found in py-solc-x. '
+                f'Installed versions before install: {sorted(installed_versions)}'
+            )
+            print(f'Installing solc {SOLC_VERSION}...')
+            solcx.install_solc(SOLC_VERSION)
+
+        installed_versions = {str(version) for version in solcx.get_installed_solc_versions()}
+        if SOLC_VERSION not in installed_versions:
+            raise RuntimeError(
+                f'Solidity compiler {SOLC_VERSION} is still not visible after install. '
+                f'Installed versions: {sorted(installed_versions)}'
+            )
+
+        solcx.set_solc_version(SOLC_VERSION)
+
+        print(f'Contract path: {contract_path}')
+        print(f'Solc version: {SOLC_VERSION}')
+        print(
+            f'optimize={SOLC_OPTIMIZE} '
+            f'optimize_runs={SOLC_OPTIMIZE_RUNS} '
+            f'via_ir={SOLC_VIA_IR}'
         )
 
-    try:
-        solcx.set_solc_version(SOLC_VERSION)
         source = contract_path.read_text(encoding='utf-8')
+
         compiled: Dict[str, Dict[str, Any]] = solcx.compile_source(
             source,
             output_values=SOLC_OUTPUT_VALUES,
@@ -40,6 +60,7 @@ def compile_commitment_ledger_contract(contract_path: Path) -> Tuple[Any, str]:
             optimize_runs=SOLC_OPTIMIZE_RUNS,
             via_ir=SOLC_VIA_IR,
         )
+
     except Exception as exc:
         raise RuntimeError(
             f'Could not compile {contract_path} with solc={SOLC_VERSION}, '
@@ -48,6 +69,13 @@ def compile_commitment_ledger_contract(contract_path: Path) -> Tuple[Any, str]:
         ) from exc
 
     contract_key = next((key for key in compiled if key.endswith(':CommitmentLedger')), None)
+
     if contract_key is None:
-        raise RuntimeError(f'Compilation succeeded, but CommitmentLedger was not found in {contract_path}')
+        raise RuntimeError(
+            f'Compilation succeeded, but CommitmentLedger was not found in {contract_path}. '
+            f'Compiled contracts: {list(compiled.keys())}'
+        )
+
+    print('Contract compiled OK')
+
     return compiled[contract_key]['abi'], compiled[contract_key]['bin']
