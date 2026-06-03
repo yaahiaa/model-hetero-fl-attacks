@@ -157,6 +157,27 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
         handle.write(json.dumps(_json_safe(payload), sort_keys=True) + '\n')
 
 
+_OVERHEAD_RESERVED_KEYS = {'round', 'round_id', 'event', 'duration_sec'}
+
+
+def _sanitize_backend_metrics(metrics: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+    sanitized = dict(metrics or {})
+    if 'duration_sec' in sanitized:
+        sanitized[f'{prefix}_backend_duration_sec'] = sanitized.pop('duration_sec')
+    for key in list(sanitized.keys()):
+        if key in _OVERHEAD_RESERVED_KEYS:
+            sanitized[f'{prefix}_{key}'] = sanitized.pop(key)
+    return sanitized
+
+
+def _sanitize_overhead_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = dict(payload or {})
+    for key in list(sanitized.keys()):
+        if key in _OVERHEAD_RESERVED_KEYS:
+            sanitized[f'payload_{key}'] = sanitized.pop(key)
+    return sanitized
+
+
 def _artifact_ref_from_dict(payload: Dict[str, Any]) -> ArtifactRef:
     return ArtifactRef(
         cid=str(payload['cid']),
@@ -967,12 +988,19 @@ class CommitmentService:
         self.overhead_path = self.round_log_dir / 'commitment_overhead.jsonl'
 
     def _artifact_metrics(self) -> Dict[str, Any]:
-        return dict(getattr(self.artifact_store, 'last_metrics', {}) or {})
+        return _sanitize_backend_metrics(
+            getattr(self.artifact_store, 'last_metrics', {}) or {},
+            'artifact',
+        )
 
     def _ledger_metrics(self) -> Dict[str, Any]:
-        return dict(getattr(self.ledger, 'last_metrics', {}) or {})
+        return _sanitize_backend_metrics(
+            getattr(self.ledger, 'last_metrics', {}) or {},
+            'ledger',
+        )
 
-    def _record_overhead(self, round_id: int, event: str, duration_sec: float, **payload) -> None:
+    def _record_overhead(self, overhead_round_id: int, overhead_event: str, overhead_duration_sec: float, **payload) -> None:
+        payload = _sanitize_overhead_payload(payload)
         _append_jsonl(
             self.overhead_path,
             {
@@ -980,9 +1008,9 @@ class CommitmentService:
                 'commitment_backend': str(self.cfg.get('commitment_backend', 'local')),
                 'artifact_store_backend': str(self.cfg.get('artifact_store_backend', getattr(self.artifact_store, 'backend_name', 'local'))),
                 'ledger_backend': str(self.cfg.get('ledger_backend', getattr(self.ledger, 'backend_name', 'json'))),
-                'round': int(round_id),
-                'event': str(event),
-                'duration_sec': float(duration_sec),
+                'round': int(overhead_round_id),
+                'event': str(overhead_event),
+                'duration_sec': float(overhead_duration_sec),
                 'success': bool(payload.pop('success', True)),
                 **_json_safe(payload),
             },
