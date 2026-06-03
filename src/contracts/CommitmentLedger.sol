@@ -6,6 +6,7 @@ contract CommitmentLedger {
         bool exists;
         uint256 roundId;
         bytes32 previousParentHash;
+        string previousParentCid;
         bytes32 candidateParentHash;
         string candidateCid;
         bytes32 artifactSha256;
@@ -21,13 +22,14 @@ contract CommitmentLedger {
     struct Report {
         bool exists;
         uint256 roundId;
+        bytes32 candidateParentHash;
         uint256 verifierUserId;
         uint256 cohortRateScaled;
         bool approved;
-        string reason;
+        uint8 reasonCode;
+        uint16 failedChecksBitmask;
         uint256 relativeChangeScaled;
-        bytes32 reportHash;
-        string reportJsonOrEmpty;
+        bytes32 attestationHash;
         address submitter;
         uint256 timestamp;
     }
@@ -65,7 +67,17 @@ contract CommitmentLedger {
         uint256 timestamp
     );
     event CandidateSubmitted(uint256 roundId, bytes32 previousParentHash, bytes32 candidateParentHash, string cid, address submitter);
-    event VerificationReportSubmitted(uint256 roundId, uint256 verifierUserId, bool approved, bytes32 reportHash, address submitter);
+    event VerificationReportSubmitted(
+        uint256 indexed roundId,
+        bytes32 indexed candidateParentHash,
+        uint256 indexed verifierUserId,
+        uint256 cohortRateScaled,
+        bool approved,
+        uint8 reasonCode,
+        uint16 failedChecksBitmask,
+        uint256 relativeChangeScaled,
+        address submitter
+    );
     event RoundFinalized(uint256 roundId, bool approved, uint256 numApproved, uint256 numRejected, string quorumRule);
 
     function commitGenesisParent(
@@ -87,6 +99,7 @@ contract CommitmentLedger {
     function submitCandidate(
         uint256 roundId,
         bytes32 previousParentHash,
+        string calldata previousParentCid,
         bytes32 candidateParentHash,
         string calldata cid,
         bytes32 artifactSha256,
@@ -106,6 +119,7 @@ contract CommitmentLedger {
         candidate.exists = true;
         candidate.roundId = roundId;
         candidate.previousParentHash = previousParentHash;
+        candidate.previousParentCid = previousParentCid;
         candidate.candidateParentHash = candidateParentHash;
         candidate.candidateCid = cid;
         candidate.artifactSha256 = artifactSha256;
@@ -129,29 +143,51 @@ contract CommitmentLedger {
 
     function submitVerificationReport(
         uint256 roundId,
+        bytes32 candidateParentHash,
         uint256 verifierUserId,
         uint256 cohortRateScaled,
         bool approved,
-        string calldata reason,
-        uint256 relativeChangeScaled,
-        bytes32 reportHash,
-        string calldata reportJsonOrEmpty
+        uint8 reasonCode,
+        uint16 failedChecksBitmask,
+        uint256 relativeChangeScaled
     ) external {
         require(candidates[roundId].exists, "missing candidate");
+        require(candidates[roundId].candidateParentHash == candidateParentHash, "candidate hash mismatch");
+        bytes32 attestationHash = keccak256(abi.encode(
+            roundId,
+            candidateParentHash,
+            verifierUserId,
+            cohortRateScaled,
+            approved,
+            reasonCode,
+            failedChecksBitmask,
+            relativeChangeScaled
+        ));
         reportsByRound[roundId].push(Report({
             exists: true,
             roundId: roundId,
+            candidateParentHash: candidateParentHash,
             verifierUserId: verifierUserId,
             cohortRateScaled: cohortRateScaled,
             approved: approved,
-            reason: reason,
+            reasonCode: reasonCode,
+            failedChecksBitmask: failedChecksBitmask,
             relativeChangeScaled: relativeChangeScaled,
-            reportHash: reportHash,
-            reportJsonOrEmpty: reportJsonOrEmpty,
+            attestationHash: attestationHash,
             submitter: msg.sender,
             timestamp: block.timestamp
         }));
-        emit VerificationReportSubmitted(roundId, verifierUserId, approved, reportHash, msg.sender);
+        emit VerificationReportSubmitted(
+            roundId,
+            candidateParentHash,
+            verifierUserId,
+            cohortRateScaled,
+            approved,
+            reasonCode,
+            failedChecksBitmask,
+            relativeChangeScaled,
+            msg.sender
+        );
     }
 
     function finalizeRound(uint256 roundId, string calldata quorumRule) external {

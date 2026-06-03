@@ -65,6 +65,12 @@ Contract deployed at <address>
 
 The Solidity contract is compiled with `solc 0.8.24`, optimizer enabled, `optimize_runs=200`, and `viaIR=true`. The `viaIR` setting is required because default Solidity compilation can hit a "Stack too deep" error for the commitment contract.
 
+## Compact Verifier Attestations
+
+Verifier reports are committed as compact attestations. Detailed verifier-side measurements such as validation loss, accuracy, and behavior-freeze deltas are computed locally to make the approval/rejection decision, but they are not stored on-chain and are not uploaded to IPFS.
+
+The candidate commitment stores the previous and candidate parent CIDs once per round. Each verifier attestation references the candidate by round and candidate hash, and stores only verifier identity, cohort/model rate, approval status, reason code, failed-check bitmask, and scaled relative change.
+
 ## Smoke Test
 
 ```bash

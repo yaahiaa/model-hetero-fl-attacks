@@ -53,6 +53,7 @@ class CandidateRecord:
     committee_ids: List[int]
     metadata: Dict[str, Any]
     timestamp: float
+    previous_parent_cid: Optional[str] = None
 
 
 @dataclass
@@ -200,6 +201,7 @@ def _candidate_record_from_dict(payload: Dict[str, Any]) -> CandidateRecord:
         committee_ids=[int(v) for v in payload.get('committee_ids', [])],
         metadata=dict(payload.get('metadata', {})),
         timestamp=float(payload['timestamp']),
+        previous_parent_cid=payload.get('previous_parent_cid') or payload.get('metadata', {}).get('previous_parent_cid'),
     )
 
 
@@ -216,6 +218,76 @@ def _verification_report_from_dict(payload: Dict[str, Any]) -> VerificationRepor
         metrics=dict(payload.get('metrics', {})),
         timestamp=float(payload['timestamp']),
     )
+
+
+_REASON_CODE_MAP = {
+    'ok': 0,
+    'validation loss increased too much': 1,
+    'validation accuracy dropped too much': 2,
+    'candidate too similar to previous approved parent': 3,
+    'candidate too different from previous approved parent': 4,
+    'behavior_frozen': 5,
+    'candidate has parameter drift but frozen verifier behavior': 5,
+    'schedule_mismatch': 6,
+    'artifact_verification_failed': 7,
+    'unknown': 255,
+}
+
+_REASON_TEXT_BY_CODE = {
+    0: 'ok',
+    1: 'validation loss increased too much',
+    2: 'validation accuracy dropped too much',
+    3: 'candidate too similar to previous approved parent',
+    4: 'candidate too different from previous approved parent',
+    5: 'candidate has parameter drift but frozen verifier behavior',
+    6: 'schedule_mismatch',
+    7: 'artifact_verification_failed',
+    255: 'unknown',
+}
+
+
+def _reason_to_code(reason: str) -> int:
+    return int(_REASON_CODE_MAP.get(str(reason or 'unknown').strip().lower(), 255))
+
+
+def _reason_from_code(reason_code: int) -> str:
+    return _REASON_TEXT_BY_CODE.get(int(reason_code), 'unknown')
+
+
+def _failed_checks_bitmask(report: VerificationReport) -> int:
+    reason_code = _reason_to_code(report.reason)
+    bit_by_reason_code = {
+        1: 0,
+        2: 1,
+        3: 2,
+        4: 3,
+        5: 4,
+        6: 5,
+        7: 6,
+    }
+    bitmask = 0
+    if reason_code in bit_by_reason_code:
+        bitmask |= 1 << bit_by_reason_code[reason_code]
+    metrics = dict(report.metrics or {})
+    if metrics.get('behavior_frozen') is True:
+        bitmask |= 1 << 4
+    return bitmask
+
+
+def _compact_attestation_from_report(report: VerificationReport, candidate_parent_hash: str) -> Dict[str, Any]:
+    reason_code = _reason_to_code(report.reason)
+    failed_checks_bitmask = _failed_checks_bitmask(report)
+    relative_change_scaled = _scale_relative_change(report.relative_change)
+    return {
+        'round_id': int(report.round_id),
+        'candidate_parent_hash': str(candidate_parent_hash),
+        'verifier_user_id': int(report.verifier_user_id),
+        'cohort_rate_scaled': _scale_rate(report.cohort_rate),
+        'approved': bool(report.approved),
+        'reason_code': int(reason_code),
+        'failed_checks_bitmask': int(failed_checks_bitmask),
+        'relative_change_scaled': int(relative_change_scaled),
+    }
 
 
 def _quorum_decision_from_dict(payload: Dict[str, Any]) -> QuorumDecision:
@@ -521,6 +593,13 @@ class JsonCommitmentLedger(CommitmentLedger):
         round_key = str(report.round_id)
         reports = state['reports'].setdefault(round_key, [])
         payload = _json_safe(report)
+        candidate_payload = state['candidates'].get(round_key)
+        if candidate_payload is not None:
+            candidate_record = _candidate_record_from_dict(candidate_payload)
+            payload['compact_attestation'] = _compact_attestation_from_report(
+                report,
+                candidate_record.candidate_parent_hash,
+            )
         reports.append(payload)
         record_id = self._record_id('report', payload)
         self._write_state(state)
@@ -689,10 +768,12 @@ class EthereumCommitmentLedger(CommitmentLedger):
         self.receipt_timeout_sec = int(blockchain_receipt_timeout_sec)
         self.gas_limit = int(blockchain_gas_limit)
         self.gas_price_wei = None if blockchain_gas_price_wei in (None, '') else int(blockchain_gas_price_wei)
-        self.store_full_report_json = bool(blockchain_store_full_report_json) or str(blockchain_report_payload_mode).lower() == 'full_json'
         self.report_payload_mode = str(blockchain_report_payload_mode or 'hash_only').lower()
         if self.report_payload_mode not in {'hash_only', 'full_json'}:
             raise ValueError('blockchain_report_payload_mode must be one of: hash_only, full_json')
+        self.store_full_report_json = False
+        if bool(blockchain_store_full_report_json) or self.report_payload_mode == 'full_json':
+            print('[COMMIT][ETH] Full verifier report JSON is not stored in compact attestation mode.')
         self.backend_name = 'ethereum'
         self.last_metrics: Dict[str, Any] = {}
         self.last_receipt = None
@@ -827,6 +908,7 @@ class EthereumCommitmentLedger(CommitmentLedger):
             self.contract.functions.submitCandidate(
                 int(candidate_record.round_id),
                 _require_hex_bytes32(candidate_record.previous_parent_hash, 'previous_parent_hash'),
+                str(candidate_record.previous_parent_cid or candidate_record.metadata.get('previous_parent_cid', '')),
                 _require_hex_bytes32(candidate_record.candidate_parent_hash, 'candidate_parent_hash'),
                 str(candidate_record.candidate_artifact.cid),
                 _require_hex_bytes32(candidate_record.candidate_artifact.sha256, 'artifact_sha256'),
@@ -841,22 +923,20 @@ class EthereumCommitmentLedger(CommitmentLedger):
         )
 
     def submit_verifier_report(self, report: VerificationReport) -> str:
-        payload = _json_safe(report)
-        report_json = json.dumps(payload, sort_keys=True)
-        report_hash = _require_hex_bytes32(_sha256_bytes(report_json.encode('utf-8')), 'report_hash')
-        report_json_or_empty = report_json if self.store_full_report_json else ''
+        candidate_record = self.get_candidate(report.round_id)
+        payload = _compact_attestation_from_report(report, candidate_record.candidate_parent_hash)
         return self._send_transaction(
             self.contract.functions.submitVerificationReport(
-                int(report.round_id),
-                int(report.verifier_user_id),
-                _scale_rate(report.cohort_rate),
-                bool(report.approved),
-                str(report.reason),
-                _scale_relative_change(report.relative_change),
-                report_hash,
-                report_json_or_empty,
+                int(payload['round_id']),
+                _require_hex_bytes32(payload['candidate_parent_hash'], 'candidate_parent_hash'),
+                int(payload['verifier_user_id']),
+                int(payload['cohort_rate_scaled']),
+                bool(payload['approved']),
+                int(payload['reason_code']),
+                int(payload['failed_checks_bitmask']),
+                int(payload['relative_change_scaled']),
             ),
-            'report_submitted',
+            'compact_attestation_submitted',
             payload,
         )
 
@@ -875,21 +955,22 @@ class EthereumCommitmentLedger(CommitmentLedger):
         if not candidate[0]:
             raise KeyError(f'No candidate record found for round {round_id}')
         artifact = ArtifactRef(
-            cid=str(candidate[4]),
-            uri=f'ipfs://{candidate[4]}',
-            sha256=_bytes32_to_hex(candidate[5]),
-            size_bytes=int(candidate[6]),
+            cid=str(candidate[5]),
+            uri=f'ipfs://{candidate[5]}',
+            sha256=_bytes32_to_hex(candidate[6]),
+            size_bytes=int(candidate[7]),
         )
         return CandidateRecord(
             round_id=int(candidate[1]),
             previous_parent_hash=_bytes32_to_hex(candidate[2]),
-            candidate_parent_hash=_bytes32_to_hex(candidate[3]),
+            candidate_parent_hash=_bytes32_to_hex(candidate[4]),
             candidate_artifact=artifact,
-            schedule_id=str(candidate[7]),
-            active_cohorts=[int(v) / 1000000.0 for v in candidate[8]],
-            committee_ids=[int(v) for v in candidate[9]],
-            metadata={'metadata_hash': _bytes32_to_hex(candidate[12])},
-            timestamp=float(candidate[10]),
+            schedule_id=str(candidate[8]),
+            active_cohorts=[int(v) / 1000000.0 for v in candidate[9]],
+            committee_ids=[int(v) for v in candidate[10]],
+            metadata={'metadata_hash': _bytes32_to_hex(candidate[13])},
+            timestamp=float(candidate[11]),
+            previous_parent_cid=str(candidate[3]),
         )
 
     def get_reports(self, round_id: int) -> List[VerificationReport]:
@@ -900,15 +981,20 @@ class EthereumCommitmentLedger(CommitmentLedger):
                 continue
             result.append(VerificationReport(
                 round_id=int(report[1]),
-                verifier_user_id=int(report[2]),
-                cohort_rate=int(report[3]) / 1000000.0,
-                approved=bool(report[4]),
-                reason=str(report[5]),
-                relative_change=int(report[6]) / 1000000000000.0,
+                verifier_user_id=int(report[3]),
+                cohort_rate=int(report[4]) / 1000000.0,
+                approved=bool(report[5]),
+                reason=_reason_from_code(int(report[6])),
+                relative_change=int(report[8]) / 1000000000000.0,
                 prev_eval={},
                 cand_eval={},
-                metrics={'report_hash': _bytes32_to_hex(report[7])},
-                timestamp=float(report[10]),
+                metrics={
+                    'candidate_parent_hash': _bytes32_to_hex(report[2]),
+                    'reason_code': int(report[6]),
+                    'failed_checks_bitmask': int(report[7]),
+                    'attestation_hash': _bytes32_to_hex(report[9]),
+                },
+                timestamp=float(report[11]),
             ))
         return result
 
@@ -1072,6 +1158,7 @@ class CommitmentService:
             **self._artifact_metrics(),
         )
 
+        latest_parent = self.ledger.get_latest_approved_parent()
         candidate_record = CandidateRecord(
             round_id=int(round_id),
             previous_parent_hash=str(previous_parent_hash),
@@ -1082,6 +1169,11 @@ class CommitmentService:
             committee_ids=[int(v) for v in committee_ids],
             metadata=dict(metadata or {}),
             timestamp=time.time(),
+            previous_parent_cid=(
+                latest_parent.artifact.cid
+                if latest_parent is not None
+                else dict(metadata or {}).get('previous_parent_cid')
+            ),
         )
 
         ledger_start = time.perf_counter()
@@ -1178,6 +1270,19 @@ class CommitmentService:
         return committed_parent, parent_state
 
     def submit_verification_report(self, report: VerificationReport) -> str:
+        compact_attestation = {}
+        try:
+            candidate_record = self.ledger.get_candidate(report.round_id)
+            compact_attestation = _compact_attestation_from_report(report, candidate_record.candidate_parent_hash)
+        except Exception:
+            compact_attestation = {
+                'verifier_user_id': int(report.verifier_user_id),
+                'cohort_rate_scaled': _scale_rate(report.cohort_rate),
+                'approved': bool(report.approved),
+                'reason_code': _reason_to_code(report.reason),
+                'failed_checks_bitmask': _failed_checks_bitmask(report),
+                'relative_change_scaled': _scale_relative_change(report.relative_change),
+            }
         ledger_start = time.perf_counter()
         record_id = self.ledger.submit_verifier_report(report)
         self._record_overhead(
@@ -1185,6 +1290,7 @@ class CommitmentService:
             'ledger_submit_report',
             time.perf_counter() - ledger_start,
             report_id=record_id,
+            **compact_attestation,
             **self._ledger_metrics(),
         )
         return record_id
