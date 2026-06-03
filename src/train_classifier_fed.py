@@ -34,7 +34,14 @@ import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 import round_log as round_log_module
-from commitment_architecture import CommitmentService, JsonCommitmentLedger, LocalArtifactStore, VerificationReport
+from commitment_architecture import (
+    CommitmentService,
+    EthereumCommitmentLedger,
+    IPFSArtifactStore,
+    JsonCommitmentLedger,
+    LocalArtifactStore,
+    VerificationReport,
+)
 from round_log import TransparencyLog, hash_state_dict
 
 
@@ -81,6 +88,22 @@ parser.add_argument('--commitment_architecture_enabled', default=None, type=str_
 parser.add_argument('--commitment_artifact_dirname', default=None, type=str)
 parser.add_argument('--commitment_ledger_filename', default=None, type=str)
 parser.add_argument('--commitment_quorum_rule', default=None, type=str)
+parser.add_argument('--ipfs_api_url', default=None, type=str)
+parser.add_argument('--ipfs_gateway_url', default=None, type=str)
+parser.add_argument('--ipfs_pin_artifacts', default=None, type=str_to_bool)
+parser.add_argument('--blockchain_rpc_url', default=None, type=str)
+parser.add_argument('--blockchain_chain_id', default=None, type=int)
+parser.add_argument('--blockchain_private_key', default=None, type=str)
+parser.add_argument('--blockchain_account_index', default=None, type=int)
+parser.add_argument('--blockchain_contract_address', default=None, type=str)
+parser.add_argument('--blockchain_deploy_contract', default=None, type=str_to_bool)
+parser.add_argument('--blockchain_wait_for_receipt', default=None, type=str_to_bool)
+parser.add_argument('--blockchain_receipt_timeout_sec', default=None, type=int)
+parser.add_argument('--blockchain_gas_limit', default=None, type=int)
+parser.add_argument('--blockchain_gas_price_wei', default=None, type=int)
+parser.add_argument('--blockchain_store_full_report_json', default=None, type=str_to_bool)
+parser.add_argument('--blockchain_report_payload_mode', default=None, type=str)
+parser.add_argument('--commitment_measure_real_overhead', default=None, type=str_to_bool)
 parser.add_argument('--cra_committee_enabled', default=None, type=str_to_bool)
 parser.add_argument('--cra_distribution_consistency_enabled', default=None, type=str_to_bool)
 parser.add_argument('--cra_parent_commit_enabled', default=None, type=str_to_bool)
@@ -135,6 +158,22 @@ cfg.setdefault('commitment_architecture_enabled', True)
 cfg.setdefault('commitment_artifact_dirname', 'artifacts')
 cfg.setdefault('commitment_ledger_filename', 'commitment_ledger.json')
 cfg.setdefault('commitment_quorum_rule', 'majority')
+cfg.setdefault('ipfs_api_url', 'http://127.0.0.1:5001')
+cfg.setdefault('ipfs_gateway_url', 'http://127.0.0.1:8081/ipfs')
+cfg.setdefault('ipfs_pin_artifacts', True)
+cfg.setdefault('blockchain_rpc_url', 'http://127.0.0.1:8545')
+cfg.setdefault('blockchain_chain_id', 1337)
+cfg.setdefault('blockchain_private_key', None)
+cfg.setdefault('blockchain_account_index', 0)
+cfg.setdefault('blockchain_contract_address', None)
+cfg.setdefault('blockchain_deploy_contract', True)
+cfg.setdefault('blockchain_wait_for_receipt', True)
+cfg.setdefault('blockchain_receipt_timeout_sec', 120)
+cfg.setdefault('blockchain_gas_limit', 8000000)
+cfg.setdefault('blockchain_gas_price_wei', None)
+cfg.setdefault('blockchain_store_full_report_json', False)
+cfg.setdefault('blockchain_report_payload_mode', 'hash_only')
+cfg.setdefault('commitment_measure_real_overhead', True)
 cfg.setdefault('cra_committee_enabled', False)
 cfg.setdefault('cra_distribution_consistency_enabled', True)
 cfg.setdefault('cra_parent_commit_enabled', True)
@@ -181,6 +220,26 @@ if args['commitment_ledger_filename'] is not None:
     cfg['commitment_ledger_filename'] = args['commitment_ledger_filename']
 if args['commitment_quorum_rule'] is not None:
     cfg['commitment_quorum_rule'] = args['commitment_quorum_rule']
+for optional_key in [
+    'ipfs_api_url',
+    'ipfs_gateway_url',
+    'ipfs_pin_artifacts',
+    'blockchain_rpc_url',
+    'blockchain_chain_id',
+    'blockchain_private_key',
+    'blockchain_account_index',
+    'blockchain_contract_address',
+    'blockchain_deploy_contract',
+    'blockchain_wait_for_receipt',
+    'blockchain_receipt_timeout_sec',
+    'blockchain_gas_limit',
+    'blockchain_gas_price_wei',
+    'blockchain_store_full_report_json',
+    'blockchain_report_payload_mode',
+    'commitment_measure_real_overhead',
+]:
+    if args.get(optional_key) is not None:
+        cfg[optional_key] = args[optional_key]
 if args['cra_committee_enabled'] is not None:
     cfg['cra_committee_enabled'] = args['cra_committee_enabled']
 if args['cra_distribution_consistency_enabled'] is not None:
@@ -349,7 +408,14 @@ def write_overhead_summary(row):
         'experiment_id', 'experiment_method', 'seed', 'dataset', 'model_name',
         'control_name', 'num_epochs', 'total_runtime_sec', 'mean_epoch_time_sec',
         'mean_train_time_sec', 'mean_aggregation_time_sec', 'mean_committee_time_sec',
-        'mean_dp_time_sec', 'mean_test_time_sec', 'relative_notes',
+        'mean_dp_time_sec', 'mean_test_time_sec',
+        'commitment_backend', 'artifact_store_backend', 'ledger_backend',
+        'mean_artifact_put_time_sec', 'mean_artifact_get_time_sec',
+        'mean_artifact_verify_time_sec', 'mean_ledger_commit_genesis_time_sec',
+        'mean_ledger_submit_candidate_time_sec', 'mean_ledger_submit_report_time_sec',
+        'mean_ledger_finalize_time_sec', 'mean_blockchain_receipt_wait_time_sec',
+        'total_blockchain_gas_used', 'mean_ipfs_add_time_sec', 'mean_ipfs_cat_time_sec',
+        'mean_ipfs_pin_time_sec', 'relative_notes',
     ]
     append_csv_row(cfg['overhead_results_csv'], fieldnames, row)
 
@@ -367,6 +433,71 @@ def build_common_result_fields(seed):
 
 def mean_or_zero(values):
     return float(sum(values) / len(values)) if values else 0.0
+
+
+def summarize_commitment_overhead(round_log_dir):
+    path = os.path.join(round_log_dir, 'commitment_overhead.jsonl')
+    summary = {
+        'commitment_backend': cfg.get('commitment_backend', 'local'),
+        'artifact_store_backend': cfg.get('artifact_store_backend', 'local'),
+        'ledger_backend': cfg.get('ledger_backend', 'json'),
+        'mean_artifact_put_time_sec': 0.0,
+        'mean_artifact_get_time_sec': 0.0,
+        'mean_artifact_verify_time_sec': 0.0,
+        'mean_ledger_commit_genesis_time_sec': 0.0,
+        'mean_ledger_submit_candidate_time_sec': 0.0,
+        'mean_ledger_submit_report_time_sec': 0.0,
+        'mean_ledger_finalize_time_sec': 0.0,
+        'mean_blockchain_receipt_wait_time_sec': 0.0,
+        'total_blockchain_gas_used': 0,
+        'mean_ipfs_add_time_sec': 0.0,
+        'mean_ipfs_cat_time_sec': 0.0,
+        'mean_ipfs_pin_time_sec': 0.0,
+    }
+    if not os.path.exists(path):
+        return summary
+    event_durations = {
+        'artifact_put': [],
+        'artifact_get': [],
+        'artifact_verify': [],
+        'ledger_commit_genesis': [],
+        'ledger_submit_candidate': [],
+        'ledger_submit_report': [],
+        'ledger_finalize': [],
+    }
+    metric_values = {'receipt_wait_time_sec': [], 'ipfs_add_time_sec': [], 'ipfs_cat_time_sec': [], 'ipfs_pin_time_sec': []}
+    gas_values = []
+    with open(path, 'r', encoding='utf-8') as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event = payload.get('event')
+            if event in event_durations:
+                event_durations[event].append(float(payload.get('duration_sec', 0.0) or 0.0))
+            for key in metric_values:
+                if payload.get(key) not in (None, ''):
+                    metric_values[key].append(float(payload.get(key) or 0.0))
+            if payload.get('gas_used') not in (None, ''):
+                gas_values.append(int(payload.get('gas_used') or 0))
+    summary.update({
+        'mean_artifact_put_time_sec': mean_or_zero(event_durations['artifact_put']),
+        'mean_artifact_get_time_sec': mean_or_zero(event_durations['artifact_get']),
+        'mean_artifact_verify_time_sec': mean_or_zero(event_durations['artifact_verify']),
+        'mean_ledger_commit_genesis_time_sec': mean_or_zero(event_durations['ledger_commit_genesis']),
+        'mean_ledger_submit_candidate_time_sec': mean_or_zero(event_durations['ledger_submit_candidate']),
+        'mean_ledger_submit_report_time_sec': mean_or_zero(event_durations['ledger_submit_report']),
+        'mean_ledger_finalize_time_sec': mean_or_zero(event_durations['ledger_finalize']),
+        'mean_blockchain_receipt_wait_time_sec': mean_or_zero(metric_values['receipt_wait_time_sec']),
+        'total_blockchain_gas_used': sum(gas_values),
+        'mean_ipfs_add_time_sec': mean_or_zero(metric_values['ipfs_add_time_sec']),
+        'mean_ipfs_cat_time_sec': mean_or_zero(metric_values['ipfs_cat_time_sec']),
+        'mean_ipfs_pin_time_sec': mean_or_zero(metric_values['ipfs_pin_time_sec']),
+    })
+    return summary
 
 
 def apply_runtime_overrides():
@@ -405,21 +536,58 @@ def create_commitment_backend():
     ledger_backend = str(cfg.get('ledger_backend', 'json')).lower()
     commitment_backend = str(cfg.get('commitment_backend', 'local')).lower()
 
-    if commitment_backend != 'local':
+    if commitment_backend not in {'local', 'blockchain'}:
         raise ValueError(f'Unsupported commitment_backend for CRA: {commitment_backend}')
-    if artifact_backend != 'local':
+    if artifact_backend not in {'local', 'ipfs'}:
         raise ValueError(f'Unsupported artifact_store_backend for CRA: {artifact_backend}')
-    if ledger_backend != 'json':
+    if ledger_backend not in {'json', 'ethereum'}:
         raise ValueError(f'Unsupported ledger_backend for CRA: {ledger_backend}')
 
-    artifact_store = LocalArtifactStore(
-        round_log_dir,
-        artifact_dirname=cfg.get('commitment_artifact_dirname', 'artifacts'),
-    )
-    ledger = JsonCommitmentLedger(
-        round_log_dir,
-        ledger_filename=cfg.get('commitment_ledger_filename', 'commitment_ledger.json'),
-    )
+    print('[CRA-COMMIT] selected commitment backend:', commitment_backend)
+    print('[CRA-COMMIT] selected artifact backend:', artifact_backend)
+    print('[CRA-COMMIT] selected ledger backend:', ledger_backend)
+    if artifact_backend == 'ipfs':
+        print('[CRA-COMMIT] IPFS API URL:', cfg.get('ipfs_api_url'))
+    if ledger_backend == 'ethereum':
+        print('[CRA-COMMIT] blockchain RPC URL:', cfg.get('blockchain_rpc_url'))
+        print('[CRA-COMMIT] blockchain chain id:', cfg.get('blockchain_chain_id'))
+        print('[CRA-COMMIT] blockchain contract address:', cfg.get('blockchain_contract_address') or '<deploy>')
+
+    if artifact_backend == 'local':
+        artifact_store = LocalArtifactStore(
+            round_log_dir,
+            artifact_dirname=cfg.get('commitment_artifact_dirname', 'artifacts'),
+        )
+    else:
+        artifact_store = IPFSArtifactStore(
+            ipfs_api_url=cfg.get('ipfs_api_url', 'http://127.0.0.1:5001'),
+            ipfs_gateway_url=cfg.get('ipfs_gateway_url', 'http://127.0.0.1:8081/ipfs'),
+            pin_artifacts=cfg.get('ipfs_pin_artifacts', True),
+            request_timeout_sec=cfg.get('blockchain_receipt_timeout_sec', 120),
+        )
+
+    if ledger_backend == 'json':
+        ledger = JsonCommitmentLedger(
+            round_log_dir,
+            ledger_filename=cfg.get('commitment_ledger_filename', 'commitment_ledger.json'),
+        )
+    else:
+        ledger = EthereumCommitmentLedger(
+            round_log_dir=round_log_dir,
+            blockchain_rpc_url=cfg.get('blockchain_rpc_url', 'http://127.0.0.1:8545'),
+            blockchain_chain_id=cfg.get('blockchain_chain_id', 1337),
+            blockchain_private_key=cfg.get('blockchain_private_key'),
+            blockchain_account_index=cfg.get('blockchain_account_index', 0),
+            blockchain_contract_address=cfg.get('blockchain_contract_address'),
+            blockchain_deploy_contract=cfg.get('blockchain_deploy_contract', True),
+            blockchain_wait_for_receipt=cfg.get('blockchain_wait_for_receipt', True),
+            blockchain_receipt_timeout_sec=cfg.get('blockchain_receipt_timeout_sec', 120),
+            blockchain_gas_limit=cfg.get('blockchain_gas_limit', 8000000),
+            blockchain_gas_price_wei=cfg.get('blockchain_gas_price_wei'),
+            blockchain_store_full_report_json=cfg.get('blockchain_store_full_report_json', False),
+            blockchain_report_payload_mode=cfg.get('blockchain_report_payload_mode', 'hash_only'),
+        )
+        print('[CRA-COMMIT] resolved contract address:', ledger.contract_address)
     return CommitmentService(artifact_store, ledger, cfg)
 
 
@@ -1204,6 +1372,9 @@ def runExperiment():
         'cra_parent_commit_approved': experiment_tracker.get('cra_parent_commit_approved', ''),
     }
     write_leakage_result(leakage_row)
+    commitment_overhead_summary = summarize_commitment_overhead(
+        cfg.get('round_log_dir') or os.path.join('output', 'round_log', 'prototype2')
+    )
     write_overhead_summary({
         **build_common_result_fields(seed),
         'num_epochs': cfg['num_epochs']['global'],
@@ -1214,6 +1385,7 @@ def runExperiment():
         'mean_committee_time_sec': mean_or_zero(committee_times),
         'mean_dp_time_sec': mean_or_zero(dp_times),
         'mean_test_time_sec': mean_or_zero(test_times),
+        **commitment_overhead_summary,
         'relative_notes': 'convergence_mode={} disable_attack_for_convergence={}'.format(
             cfg['convergence_mode'], cfg['disable_attack_for_convergence']
         ),
