@@ -29,7 +29,7 @@ from utils import (
     makedir_exist_ok,
 )
 from logger import Logger
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
@@ -77,6 +77,15 @@ parser.add_argument('--leakage_results_csv', default=None, type=str)
 parser.add_argument('--epoch_results_csv', default=None, type=str)
 parser.add_argument('--overhead_results_csv', default=None, type=str)
 parser.add_argument('--enable_experiment_logging', default=None, type=str_to_bool)
+parser.add_argument('--metrics-dir', '--metrics_dir', dest='metrics_dir', default=None, type=str)
+parser.add_argument('--experiment-tag', '--experiment_tag', dest='experiment_tag', default=None, type=str)
+parser.add_argument('--save-recon-images', '--save_recon_images', dest='save_recon_images', default=None, type=str_to_bool)
+parser.add_argument('--save-raw-metrics', '--save_raw_metrics', dest='save_raw_metrics', default=None, type=str_to_bool)
+parser.add_argument('--defense-mode', '--defense_mode', dest='defense_mode', default=None, type=str)
+parser.add_argument('--dp-mode', '--dp_mode', dest='dp_mode', default=None, type=str)
+parser.add_argument('--noise-multiplier', '--noise_multiplier', dest='noise_multiplier', default=None, type=float)
+parser.add_argument('--clip-norm', '--clip_norm', dest='clip_norm', default=None, type=float)
+parser.add_argument('--attack-noise-amount', '--attack_noise_amount', dest='attack_noise_amount', default=None, type=float)
 parser.add_argument('--attack_blocked_zero_metrics', default=None, type=str_to_bool)
 parser.add_argument('--recovered_pearson_threshold', default=None, type=float)
 parser.add_argument('--convergence_mode', default=None, type=str_to_bool)
@@ -146,6 +155,16 @@ cfg.setdefault('results_dir', 'results')
 cfg.setdefault('leakage_results_csv', '{results_dir}/leakage_raw.csv')
 cfg.setdefault('epoch_results_csv', '{results_dir}/epoch_raw.csv')
 cfg.setdefault('overhead_results_csv', '{results_dir}/overhead_raw.csv')
+cfg.setdefault('metrics_dir', '{results_dir}/metrics')
+cfg.setdefault('plot_ready_dir', '{results_dir}/plot_ready')
+cfg.setdefault('experiment_tag', None)
+cfg.setdefault('save_recon_images', False)
+cfg.setdefault('save_raw_metrics', True)
+cfg.setdefault('defense_mode', None)
+cfg.setdefault('dp_mode', 'none')
+cfg.setdefault('noise_multiplier', None)
+cfg.setdefault('clip_norm', None)
+cfg.setdefault('attack_noise_amount', 0.0)
 cfg.setdefault('enable_experiment_logging', True)
 cfg.setdefault('attack_blocked_zero_metrics', True)
 cfg.setdefault('recovered_pearson_threshold', 0.98)
@@ -198,6 +217,19 @@ if args['overhead_results_csv'] is not None:
     cfg['overhead_results_csv'] = args['overhead_results_csv']
 if args['enable_experiment_logging'] is not None:
     cfg['enable_experiment_logging'] = args['enable_experiment_logging']
+for metrics_key in [
+    'metrics_dir',
+    'experiment_tag',
+    'save_recon_images',
+    'save_raw_metrics',
+    'defense_mode',
+    'dp_mode',
+    'noise_multiplier',
+    'clip_norm',
+    'attack_noise_amount',
+]:
+    if args.get(metrics_key) is not None:
+        cfg[metrics_key] = args[metrics_key]
 if args['attack_blocked_zero_metrics'] is not None:
     cfg['attack_blocked_zero_metrics'] = args['attack_blocked_zero_metrics']
 if args['recovered_pearson_threshold'] is not None:
@@ -326,6 +358,17 @@ def resolve_experiment_defaults():
     cfg['leakage_results_csv'] = resolve_results_path(cfg['leakage_results_csv'])
     cfg['epoch_results_csv'] = resolve_results_path(cfg['epoch_results_csv'])
     cfg['overhead_results_csv'] = resolve_results_path(cfg['overhead_results_csv'])
+    cfg['metrics_dir'] = resolve_results_path(cfg.get('metrics_dir', '{results_dir}/metrics'))
+    cfg['plot_ready_dir'] = resolve_results_path(cfg.get('plot_ready_dir', '{results_dir}/plot_ready'))
+    ensure_dir(cfg['metrics_dir'])
+    ensure_dir(cfg['plot_ready_dir'])
+    if cfg.get('defense_mode') in (None, ''):
+        if committee_enabled():
+            cfg['defense_mode'] = 'committee'
+        elif str(cfg.get('dp_mode', 'none')).lower() not in {'', 'none'}:
+            cfg['defense_mode'] = str(cfg.get('dp_mode')).lower()
+        else:
+            cfg['defense_mode'] = 'none'
 
 
 def append_csv_row(path, fieldnames, row):
@@ -346,17 +389,78 @@ def empty_reconstruction_metrics():
     return {
         'best_pearson': 0.0,
         'avg_pearson': 0.0,
+        'median_pearson': 0.0,
+        'std_pearson': 0.0,
         'best_psnr': 0.0,
         'avg_psnr': 0.0,
+        'median_psnr': 0.0,
+        'std_psnr': 0.0,
         'num_recovered': 0,
+        'num_attempted_reconstructions': 0,
+        'recovered_threshold': 0.98,
     }
 
 
 def merge_reconstruction_metrics(current_metrics, candidate_metrics):
     merged = empty_reconstruction_metrics()
     for key in merged:
-        merged[key] = max(current_metrics.get(key, 0.0), candidate_metrics.get(key, 0.0))
+        if key == 'recovered_threshold':
+            merged[key] = candidate_metrics.get(key, current_metrics.get(key, 0.98))
+        elif key == 'num_attempted_reconstructions':
+            merged[key] = max(current_metrics.get(key, 0), candidate_metrics.get(key, 0))
+        else:
+            merged[key] = max(current_metrics.get(key, 0.0), candidate_metrics.get(key, 0.0))
     return merged
+
+
+def tensor_l2_norm(value):
+    if value is None:
+        return 0.0
+    if torch.is_tensor(value):
+        return float(torch.linalg.vector_norm(value.detach().float()).item())
+    total = 0.0
+    if isinstance(value, dict):
+        for tensor in value.values():
+            if torch.is_tensor(tensor):
+                total += float(torch.sum(tensor.detach().float() ** 2).item())
+    return float(np.sqrt(total))
+
+
+def state_delta_norm(current, previous):
+    if current is None or previous is None:
+        return 0.0
+    total = 0.0
+    for key, value in current.items():
+        if key in previous and torch.is_tensor(value) and torch.is_tensor(previous[key]):
+            diff = value.detach().float().cpu() - previous[key].detach().float().cpu()
+            total += float(torch.sum(diff ** 2).item())
+    return float(np.sqrt(total))
+
+
+def metrics_reason_code(reason):
+    mapping = {
+        'ok': 0,
+        'validation loss increased too much': 1,
+        'validation accuracy dropped too much': 2,
+        'candidate too similar to previous approved parent': 3,
+        'candidate too different from previous approved parent': 4,
+        'candidate has parameter drift but frozen verifier behavior': 5,
+        'cra distribution consistency failure': 6,
+        'artifact_verification_failed': 7,
+        'cra parent commitment failure': 8,
+    }
+    return int(mapping.get(str(reason or 'unknown').strip().lower(), 255))
+
+
+def metrics_failed_bitmask(reason, behavior_frozen=False):
+    code = metrics_reason_code(reason)
+    bit_by_code = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7}
+    bitmask = 0
+    if code in bit_by_code:
+        bitmask |= 1 << bit_by_code[code]
+    if behavior_frozen:
+        bitmask |= 1 << 4
+    return int(bitmask)
 
 
 def summarize_committee_status(event):
@@ -378,7 +482,7 @@ def summarize_committee_status(event):
 
 def write_epoch_result(row):
     fieldnames = [
-        'experiment_id', 'experiment_method', 'seed', 'epoch', 'dataset', 'model_name',
+        'run_id', 'experiment_id', 'experiment_method', 'seed', 'epoch', 'dataset', 'model_name',
         'control_name', 'global_accuracy', 'global_loss', 'local_accuracy_mean',
         'local_loss_mean', 'epoch_time_sec', 'train_time_sec', 'aggregation_time_sec',
         'committee_time_sec', 'dp_time_sec', 'test_time_sec', 'attack_enabled',
@@ -390,7 +494,7 @@ def write_epoch_result(row):
 
 def write_leakage_result(row):
     fieldnames = [
-        'experiment_id', 'experiment_method', 'seed', 'dataset', 'model_name',
+        'run_id', 'experiment_id', 'experiment_method', 'seed', 'dataset', 'model_name',
         'control_name', 'global_epochs', 'local_epochs', 'local_train_size',
         'batch_size_train', 'attack_source_round', 'attack_replay_round',
         'committee_enabled', 'committee_approved', 'attack_blocked',
@@ -405,7 +509,7 @@ def write_leakage_result(row):
 
 def write_overhead_summary(row):
     fieldnames = [
-        'experiment_id', 'experiment_method', 'seed', 'dataset', 'model_name',
+        'run_id', 'experiment_id', 'experiment_method', 'seed', 'dataset', 'model_name',
         'control_name', 'num_epochs', 'total_runtime_sec', 'mean_epoch_time_sec',
         'mean_train_time_sec', 'mean_aggregation_time_sec', 'mean_committee_time_sec',
         'mean_dp_time_sec', 'mean_test_time_sec',
@@ -422,6 +526,7 @@ def write_overhead_summary(row):
 
 def build_common_result_fields(seed):
     return {
+        'run_id': cfg.get('experiment_id') or cfg.get('model_tag') or f'cra_seed_{seed}',
         'experiment_id': cfg['experiment_id'],
         'experiment_method': cfg['experiment_method'],
         'seed': seed,
@@ -433,6 +538,308 @@ def build_common_result_fields(seed):
 
 def mean_or_zero(values):
     return float(sum(values) / len(values)) if values else 0.0
+
+
+def std_or_zero(values):
+    return float(np.std(values)) if values else 0.0
+
+
+def median_or_zero(values):
+    return float(np.median(values)) if values else 0.0
+
+
+def _metric_scalar(value):
+    if torch.is_tensor(value):
+        return '<tensor>'
+    if isinstance(value, np.ndarray):
+        return '<array>'
+    if isinstance(value, (list, tuple, dict)):
+        return json.dumps(_metric_scalar_container(value), sort_keys=True)
+    if hasattr(value, 'item') and callable(value.item):
+        try:
+            return value.item()
+        except Exception:
+            return str(value)
+    return value
+
+
+def _metric_scalar_container(value):
+    if torch.is_tensor(value):
+        return {'tensor_blocked': True, 'shape': list(value.shape), 'dtype': str(value.dtype)}
+    if isinstance(value, np.ndarray):
+        return {'array_blocked': True, 'shape': list(value.shape), 'dtype': str(value.dtype)}
+    if isinstance(value, dict):
+        return {str(k): _metric_scalar_container(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_metric_scalar_container(v) for v in value]
+    if hasattr(value, 'item') and callable(value.item):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _append_metrics_csv(path, fieldnames, row):
+    ensure_dir(os.path.dirname(path))
+    file_exists = os.path.exists(path)
+    with open(path, 'a', newline='', encoding='utf-8') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({key: _metric_scalar(row.get(key, '')) for key in fieldnames})
+
+
+def _ensure_metrics_csv_header(path, fieldnames):
+    ensure_dir(os.path.dirname(path))
+    if os.path.exists(path):
+        return
+    with open(path, 'w', newline='', encoding='utf-8') as csv_file:
+        csv.DictWriter(csv_file, fieldnames=fieldnames).writeheader()
+
+
+class CraMetricsLogger:
+    def __init__(self, run_id, seed):
+        self.run_id = str(run_id)
+        self.seed = int(seed)
+        self.metrics_dir = cfg['metrics_dir']
+        self.plot_ready_dir = cfg['plot_ready_dir']
+        ensure_dir(self.metrics_dir)
+        ensure_dir(self.plot_ready_dir)
+        self.events_path = os.path.join(self.metrics_dir, 'events.jsonl')
+        self.rows = {
+            'reconstruction_raw': [],
+            'reconstruction_summary': [],
+            'cohort_convergence_raw': [],
+            'cohort_convergence_summary': [],
+            'utility_raw': [],
+            'utility_summary': [],
+            'defense_events': [],
+            'defense_summary': [],
+            'noise_dp_raw': [],
+            'noise_dp_summary': [],
+        }
+        self.schemas = {
+            'reconstruction_raw': [
+                'run_id', 'seed', 'dataset', 'model', 'attack_name', 'defense_mode',
+                'local_train_size', 'local_epochs', 'global_epochs', 'batch_size',
+                'iid_setting', 'model_rates', 'target_cohort', 'epoch', 'user_id',
+                'sample_id', 'label', 'pearson', 'psnr', 'recovered_bool',
+                'reconstruction_rank', 'layer_id', 'node_id', 'row_id',
+            ],
+            'reconstruction_summary': [
+                'run_id', 'seed', 'dataset', 'model', 'attack_name', 'defense_mode',
+                'local_train_size', 'local_epochs', 'global_epochs', 'batch_size',
+                'iid_setting', 'model_rates', 'target_cohort', 'best_pearson',
+                'avg_pearson', 'median_pearson', 'std_pearson', 'best_psnr',
+                'avg_psnr', 'median_psnr', 'std_psnr', 'num_recovered',
+                'num_attempted_reconstructions', 'recovered_threshold',
+            ],
+            'cohort_convergence_raw': [
+                'run_id', 'seed', 'dataset', 'model', 'attack_name', 'defense_mode',
+                'local_train_size', 'local_epochs', 'global_epochs', 'batch_size',
+                'iid_setting', 'model_rates', 'target_cohort', 'epoch', 'cohort_rate',
+                'num_clients', 'train_loss', 'train_accuracy', 'test_loss',
+                'test_accuracy', 'update_norm', 'parameter_delta_norm',
+                'relative_update_norm', 'before_after_cra_extraction',
+                'debug_target_update_norm', 'debug_non_target_update_norm',
+                'debug_target_to_total_update_ratio', 'debug_target_to_non_target_ratio',
+                'debug_aggregate_norm', 'debug_residual_non_target_norm',
+            ],
+            'cohort_convergence_summary': [
+                'run_id', 'seed', 'dataset', 'model', 'attack_name', 'defense_mode',
+                'cohort_rate', 'mean_train_loss', 'mean_train_accuracy',
+                'mean_test_loss', 'mean_test_accuracy', 'mean_update_norm',
+                'mean_parameter_delta_norm', 'mean_relative_update_norm',
+            ],
+            'utility_raw': [
+                'run_id', 'seed', 'dataset', 'model', 'attack_name', 'defense_mode',
+                'local_train_size', 'local_epochs', 'global_epochs', 'batch_size',
+                'iid_setting', 'model_rates', 'target_cohort', 'epoch',
+                'global_train_loss', 'global_train_accuracy', 'global_test_loss',
+                'global_test_accuracy', 'best_test_accuracy_so_far',
+                'final_test_accuracy', 'round_skipped', 'round_rejected',
+            ],
+            'utility_summary': [
+                'run_id', 'seed', 'dataset', 'model', 'attack_name', 'defense_mode',
+                'final_test_accuracy', 'final_test_loss', 'best_test_accuracy',
+                'num_epochs', 'num_rejected_rounds', 'num_skipped_rounds',
+            ],
+            'defense_events': [
+                'run_id', 'seed', 'dataset', 'model', 'attack_name', 'defense_mode',
+                'epoch', 'candidate_accepted', 'attack_blocked_bool',
+                'rejection_reason', 'reason_code', 'failed_checks_bitmask',
+                'quorum_rule', 'num_approved', 'num_rejected', 'verifier_user_id',
+                'verifier_cohort_rate', 'relative_change', 'prev_loss', 'cand_loss',
+                'loss_delta', 'prev_accuracy', 'cand_accuracy', 'accuracy_delta',
+                'behavior_frozen', 'candidate_parent_hash', 'previous_parent_hash',
+            ],
+            'defense_summary': [
+                'run_id', 'seed', 'dataset', 'model', 'attack_name', 'defense_mode',
+                'blocked_rate', 'accepted_count', 'rejected_count',
+                'most_common_rejection_reason', 'blocked_by_noise_level',
+                'blocked_by_local_train_size',
+            ],
+            'noise_dp_raw': [
+                'run_id', 'seed', 'dataset', 'model', 'attack_name', 'defense_mode',
+                'epoch', 'dp_mode', 'noise_multiplier', 'clip_norm',
+                'clipping_enabled', 'number_clipped_updates', 'fraction_clipped',
+                'update_norm_before_clip_mean', 'update_norm_after_clip_mean',
+                'estimated_noise_std', 'noise_seed', 'attack_side_noise_amount',
+                'attack_side_noise_std', 'bias_grad_abs_min',
+                'bias_grad_abs_median', 'bias_grad_abs_mean', 'bias_grad_abs_max',
+                'weight_grad_abs_mean', 'weight_grad_abs_median',
+                'denominator_near_zero_count', 'denominator_near_zero_threshold',
+            ],
+            'noise_dp_summary': [
+                'run_id', 'seed', 'dataset', 'model', 'attack_name', 'defense_mode',
+                'dp_mode', 'noise_multiplier', 'clip_norm',
+                'mean_fraction_clipped', 'mean_estimated_noise_std',
+                'attack_side_noise_amount',
+            ],
+        }
+        for name, schema in self.schemas.items():
+            _ensure_metrics_csv_header(os.path.join(self.metrics_dir, f'{name}.csv'), schema)
+        self.write_config()
+
+    def common(self):
+        return {
+            'run_id': self.run_id,
+            'seed': self.seed,
+            'dataset': cfg['data_name'],
+            'model': cfg['model_name'],
+            'attack_name': 'CRA',
+            'defense_mode': cfg.get('defense_mode', 'none'),
+            'local_train_size': cfg.get('local_train_size', ''),
+            'local_epochs': cfg['num_epochs']['local'],
+            'global_epochs': cfg['num_epochs']['global'],
+            'batch_size': safe_cfg_get('batch_size', default={}).get('train', ''),
+            'iid_setting': cfg.get('control', {}).get('data_split_mode', cfg.get('data_split_mode', '')),
+            'model_rates': json.dumps(cfg.get('model_rate', [])),
+            'target_cohort': 0.5,
+        }
+
+    def write_config(self):
+        path = os.path.join(self.metrics_dir, 'resolved_config.json')
+        with open(path, 'w', encoding='utf-8') as handle:
+            json.dump(_metric_scalar_container(dict(cfg)), handle, indent=2, sort_keys=True)
+
+    def event(self, event_type, payload):
+        with open(self.events_path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(_metric_scalar_container({
+                'run_id': self.run_id,
+                'seed': self.seed,
+                'event_type': event_type,
+                'timestamp': time.time(),
+                **dict(payload or {}),
+            }), sort_keys=True) + '\n')
+
+    def write(self, name, row):
+        full_row = {**self.common(), **dict(row or {})}
+        self.rows[name].append(full_row)
+        _append_metrics_csv(os.path.join(self.metrics_dir, f'{name}.csv'), self.schemas[name], full_row)
+
+    def write_many(self, name, rows):
+        for row in rows or []:
+            self.write(name, row)
+
+    def finalize(self, epoch_rows, reconstruction_metrics):
+        utility_rows = self.rows['utility_raw']
+        best_acc = max([float(r.get('global_test_accuracy') or 0.0) for r in utility_rows], default=0.0)
+        final_acc = float(utility_rows[-1].get('global_test_accuracy') or 0.0) if utility_rows else 0.0
+        final_loss = float(utility_rows[-1].get('global_test_loss') or 0.0) if utility_rows else 0.0
+        self.write('utility_summary', {
+            'final_test_accuracy': final_acc,
+            'final_test_loss': final_loss,
+            'best_test_accuracy': best_acc,
+            'num_epochs': len(utility_rows),
+            'num_rejected_rounds': sum(1 for r in utility_rows if bool(r.get('round_rejected', False))),
+            'num_skipped_rounds': sum(1 for r in utility_rows if bool(r.get('round_skipped', False))),
+        })
+        self.write('reconstruction_summary', reconstruction_metrics)
+        self._finalize_defense_summary()
+        self._finalize_noise_summary()
+        self._finalize_cohort_summary()
+        self._write_plot_ready()
+
+    def _finalize_defense_summary(self):
+        rows = self.rows['defense_events']
+        if not rows:
+            self.write('defense_summary', {'blocked_rate': 0.0, 'accepted_count': 0, 'rejected_count': 0})
+            return
+        round_rows = [r for r in rows if r.get('verifier_user_id') in ('', None)]
+        if not round_rows:
+            round_rows = rows
+        denom = max(len(round_rows), 1)
+        rejected = [r for r in round_rows if not bool(r.get('candidate_accepted', False))]
+        accepted = [r for r in round_rows if bool(r.get('candidate_accepted', False))]
+        reasons = [str(r.get('rejection_reason', '')) for r in rejected if r.get('rejection_reason')]
+        self.write('defense_summary', {
+            'blocked_rate': float(len(rejected) / denom),
+            'accepted_count': len(accepted),
+            'rejected_count': len(rejected),
+            'most_common_rejection_reason': Counter(reasons).most_common(1)[0][0] if reasons else '',
+            'blocked_by_noise_level': cfg.get('attack_noise_amount', ''),
+            'blocked_by_local_train_size': cfg.get('local_train_size', ''),
+        })
+
+    def _finalize_noise_summary(self):
+        rows = self.rows['noise_dp_raw']
+        self.write('noise_dp_summary', {
+            'dp_mode': cfg.get('dp_mode', 'none'),
+            'noise_multiplier': cfg.get('noise_multiplier', ''),
+            'clip_norm': cfg.get('clip_norm', ''),
+            'mean_fraction_clipped': mean_or_zero([float(r.get('fraction_clipped') or 0.0) for r in rows]),
+            'mean_estimated_noise_std': mean_or_zero([float(r.get('estimated_noise_std') or 0.0) for r in rows]),
+            'attack_side_noise_amount': cfg.get('attack_noise_amount', 0.0),
+        })
+
+    def _finalize_cohort_summary(self):
+        rows = self.rows['cohort_convergence_raw']
+        by_cohort = {}
+        for row in rows:
+            by_cohort.setdefault(row.get('cohort_rate', ''), []).append(row)
+        if not by_cohort:
+            self.write('cohort_convergence_summary', {
+                'cohort_rate': '',
+                'mean_train_loss': 0.0,
+                'mean_train_accuracy': 0.0,
+                'mean_test_loss': 0.0,
+                'mean_test_accuracy': 0.0,
+                'mean_update_norm': 0.0,
+                'mean_parameter_delta_norm': 0.0,
+                'mean_relative_update_norm': 0.0,
+            })
+            return
+        for cohort, cohort_rows in by_cohort.items():
+            self.write('cohort_convergence_summary', {
+                'cohort_rate': cohort,
+                'mean_train_loss': mean_or_zero([float(r.get('train_loss') or 0.0) for r in cohort_rows]),
+                'mean_train_accuracy': mean_or_zero([float(r.get('train_accuracy') or 0.0) for r in cohort_rows]),
+                'mean_test_loss': mean_or_zero([float(r.get('test_loss') or 0.0) for r in cohort_rows]),
+                'mean_test_accuracy': mean_or_zero([float(r.get('test_accuracy') or 0.0) for r in cohort_rows]),
+                'mean_update_norm': mean_or_zero([float(r.get('update_norm') or 0.0) for r in cohort_rows]),
+                'mean_parameter_delta_norm': mean_or_zero([float(r.get('parameter_delta_norm') or 0.0) for r in cohort_rows]),
+                'mean_relative_update_norm': mean_or_zero([float(r.get('relative_update_norm') or 0.0) for r in cohort_rows]),
+            })
+
+    def _copy_plot_ready(self, source_name, dest_name):
+        src = os.path.join(self.metrics_dir, f'{source_name}.csv')
+        dst = os.path.join(self.plot_ready_dir, dest_name)
+        if os.path.exists(src):
+            shutil.copy(src, dst)
+
+    def _write_plot_ready(self):
+        self._copy_plot_ready('reconstruction_summary', 'cra_privacy_by_local_train_size.csv')
+        self._copy_plot_ready('reconstruction_summary', 'cra_privacy_by_noise.csv')
+        self._copy_plot_ready('utility_raw', 'cra_utility_by_epoch.csv')
+        self._copy_plot_ready('defense_summary', 'cra_defense_block_rate.csv')
+        self._copy_plot_ready('noise_dp_summary', 'cra_dp_comparison.csv')
+        overhead_src = cfg.get('overhead_results_csv')
+        if overhead_src and os.path.exists(overhead_src):
+            shutil.copy(overhead_src, os.path.join(self.plot_ready_dir, 'cra_overhead_summary.csv'))
 
 
 def summarize_commitment_overhead(round_log_dir):
@@ -1098,6 +1505,7 @@ def verify_and_commit_candidate_parent_via_service(
         'round_produced': int(epoch),
         'parent_for_round': round_id,
         'model_hash': candidate_record.candidate_parent_hash,
+        'previous_parent_hash': previous_parent_record.parent_hash,
         'artifact_ref': {
             'cid': candidate_record.candidate_artifact.cid,
             'uri': candidate_record.candidate_artifact.uri,
@@ -1187,6 +1595,8 @@ def runExperiment():
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+    run_id = cfg.get('experiment_id') or cfg.get('model_tag') or f'cra_seed_{seed}'
+    metrics_logger = CraMetricsLogger(run_id=run_id, seed=seed)
     dataset = fetch_dataset(cfg['data_name'], cfg['subset'])
     process_dataset(dataset)
     model = eval('models.{}(model_rate=cfg["global_model_rate"]).to(cfg["device"])'.format(cfg['model_name']))
@@ -1204,6 +1614,7 @@ def runExperiment():
         'cra_distribution_violation_user': '',
         'cra_distribution_relative_change': 0.0,
         'cra_parent_commit_approved': '',
+        'metrics_logger': metrics_logger,
     }
     total_runtime_start = now_seconds()
 
@@ -1312,6 +1723,19 @@ def runExperiment():
         }
         experiment_tracker['epoch_rows'].append(epoch_row)
         write_epoch_result(epoch_row)
+        metrics_logger.write('utility_raw', {
+            'epoch': int(epoch),
+            'global_train_loss': float(logger.mean.get('train/Local-Loss', 0.0)),
+            'global_train_accuracy': float(logger.mean.get('train/Local-Accuracy', 0.0)),
+            'global_test_loss': final_global_loss,
+            'global_test_accuracy': final_global_accuracy,
+            'best_test_accuracy_so_far': max(
+                [float(row.get('global_accuracy', 0.0)) for row in experiment_tracker['epoch_rows']]
+            ),
+            'final_test_accuracy': final_global_accuracy,
+            'round_skipped': bool(train_context.get('round_skipped', False)),
+            'round_rejected': bool(train_context.get('candidate_rejected_this_epoch', False)),
+        })
         logger.safe(False)
 
         model_state_dict = model.state_dict()
@@ -1390,6 +1814,7 @@ def runExperiment():
             cfg['convergence_mode'], cfg['disable_attack_for_convergence']
         ),
     })
+    metrics_logger.finalize(epoch_rows, reconstruction_metrics)
     logger.safe(False)
     return
 
@@ -1423,6 +1848,21 @@ def train(
     aggregation_time_sec = 0.0
     committee_time_sec = 0.0
     dp_time_sec = 0.0
+    metrics_logger = experiment_tracker.get('metrics_logger')
+    previous_global_state = clone_state_dict(federation.global_parameters)
+    if metrics_logger is not None:
+        metrics_logger.write('noise_dp_raw', {
+            'epoch': int(epoch),
+            'dp_mode': cfg.get('dp_mode', 'none'),
+            'noise_multiplier': cfg.get('noise_multiplier', ''),
+            'clip_norm': cfg.get('clip_norm', ''),
+            'clipping_enabled': cfg.get('clip_norm') not in (None, ''),
+            'number_clipped_updates': '',
+            'fraction_clipped': '',
+            'estimated_noise_std': cfg.get('noise_multiplier', ''),
+            'attack_side_noise_amount': cfg.get('attack_noise_amount', 0.0),
+            'attack_side_noise_std': cfg.get('attack_noise_amount', 0.0),
+        })
 
     if runtime_control.get('skip_next_epoch', False):
         runtime_control['skip_next_epoch'] = False
@@ -1445,6 +1885,7 @@ def train(
             'committee_enabled': committee_enabled(),
             'committee_approved_this_epoch': '',
             'candidate_rejected_this_epoch': False,
+            'round_skipped': True,
         }
 
     global_model.train(True)
@@ -1478,6 +1919,22 @@ def train(
                 'reason': str(violating_report['reason']),
             }
             append_round_log_event(commitment_backend, event)
+            if metrics_logger is not None:
+                metrics_logger.write('defense_events', {
+                    'epoch': int(epoch),
+                    'candidate_accepted': False,
+                    'attack_blocked_bool': True,
+                    'rejection_reason': 'cra distribution consistency failure',
+                    'reason_code': metrics_reason_code('cra distribution consistency failure'),
+                    'failed_checks_bitmask': metrics_failed_bitmask('cra distribution consistency failure'),
+                    'num_approved': 0,
+                    'num_rejected': 1,
+                    'verifier_user_id': int(event['user_id']),
+                    'verifier_cohort_rate': float(event['cohort']),
+                    'relative_change': float(event['relative_diff']),
+                    'candidate_parent_hash': '',
+                    'previous_parent_hash': event['expected_parent_hash'],
+                })
             logger.append({
                 'info': [
                     f'[CRA-COMMIT] distribution violation blocked round {epoch}',
@@ -1511,6 +1968,7 @@ def train(
                 'committee_enabled': committee_enabled(),
                 'committee_approved_this_epoch': False,
                 'candidate_rejected_this_epoch': False,
+                'round_skipped': False,
             }
 
     target_users = []
@@ -1555,6 +2013,27 @@ def train(
 
     honest_aggregated_state = clone_state_dict(federation.global_parameters)
     final_parent_state = honest_aggregated_state
+    aggregate_delta_norm = state_delta_norm(honest_aggregated_state, previous_global_state)
+    if metrics_logger is not None:
+        cohort_counts = Counter(float(federation.model_rate[uid]) for uid in user_idx)
+        for cohort_rate, num_clients in sorted(cohort_counts.items()):
+            cohort_update_norms = []
+            for m in range(num_active_users):
+                if float(federation.model_rate[user_idx[m]]) == float(cohort_rate):
+                    cohort_update_norms.append(state_delta_norm(local_parameters[m], distributed_local_parameters[m]))
+            update_norm = mean_or_zero(cohort_update_norms)
+            metrics_logger.write('cohort_convergence_raw', {
+                'epoch': int(epoch),
+                'cohort_rate': float(cohort_rate),
+                'num_clients': int(num_clients),
+                'train_loss': float(logger.mean.get('train/Local-Loss', 0.0)),
+                'train_accuracy': float(logger.mean.get('train/Local-Accuracy', 0.0)),
+                'update_norm': update_norm,
+                'parameter_delta_norm': aggregate_delta_norm,
+                'relative_update_norm': float(update_norm / (aggregate_delta_norm + 1.0e-12)),
+                'before_after_cra_extraction': 'after' if attack_round else 'before',
+                'debug_aggregate_norm': aggregate_delta_norm,
+            })
 
     if parent_commit_enabled():
         candidate_parent_state, candidate_meta = build_candidate_parent_for_commitment(
@@ -1575,6 +2054,47 @@ def train(
         )
         committee_time_sec += now_seconds() - committee_timer_start
         committee_status = summarize_committee_status(commitment_event)
+        if metrics_logger is not None:
+            metrics_logger.write('defense_events', {
+                'epoch': int(epoch),
+                'candidate_accepted': bool(commitment_event['approved']),
+                'attack_blocked_bool': not bool(commitment_event['approved']),
+                'rejection_reason': '' if commitment_event['approved'] else commitment_event.get('quorum_decision_reason', ''),
+                'reason_code': metrics_reason_code('ok' if commitment_event['approved'] else 'cra parent commitment failure'),
+                'failed_checks_bitmask': 0 if commitment_event['approved'] else metrics_failed_bitmask('cra parent commitment failure'),
+                'quorum_rule': commitment_event.get('quorum_rule', ''),
+                'num_approved': int(commitment_event.get('decision_num_approved', 0)),
+                'num_rejected': int(commitment_event.get('decision_num_rejected', 0)),
+                'candidate_parent_hash': commitment_event.get('model_hash', ''),
+                'previous_parent_hash': commitment_event.get('previous_parent_hash', ''),
+            })
+            for verifier_report in commitment_event.get('verifier_reports', []):
+                prev_eval = verifier_report.get('prev_eval', {})
+                cand_eval = verifier_report.get('cand_eval', {})
+                reason = verifier_report.get('reason', '')
+                metrics_logger.write('defense_events', {
+                    'epoch': int(epoch),
+                    'candidate_accepted': bool(commitment_event['approved']),
+                    'attack_blocked_bool': not bool(commitment_event['approved']),
+                    'rejection_reason': reason,
+                    'reason_code': metrics_reason_code(reason),
+                    'failed_checks_bitmask': metrics_failed_bitmask(reason, verifier_report.get('behavior_frozen', False)),
+                    'quorum_rule': commitment_event.get('quorum_rule', ''),
+                    'num_approved': int(commitment_event.get('decision_num_approved', 0)),
+                    'num_rejected': int(commitment_event.get('decision_num_rejected', 0)),
+                    'verifier_user_id': int(verifier_report.get('user_id', -1)),
+                    'verifier_cohort_rate': float(verifier_report.get('cohort_rate', 0.0)),
+                    'relative_change': float(verifier_report.get('relative_change', 0.0)),
+                    'prev_loss': float(prev_eval.get('Local-Loss', 0.0)),
+                    'cand_loss': float(cand_eval.get('Local-Loss', 0.0)),
+                    'loss_delta': float(cand_eval.get('Local-Loss', 0.0)) - float(prev_eval.get('Local-Loss', 0.0)),
+                    'prev_accuracy': float(prev_eval.get('Local-Accuracy', 0.0)),
+                    'cand_accuracy': float(cand_eval.get('Local-Accuracy', 0.0)),
+                    'accuracy_delta': float(cand_eval.get('Local-Accuracy', 0.0)) - float(prev_eval.get('Local-Accuracy', 0.0)),
+                    'behavior_frozen': bool(verifier_report.get('behavior_frozen', False)),
+                    'candidate_parent_hash': commitment_event.get('model_hash', ''),
+                    'previous_parent_hash': commitment_event.get('previous_parent_hash', ''),
+                })
         experiment_tracker['committee_approved'] = committee_status['committee_approved']
         experiment_tracker['cra_parent_commit_approved'] = committee_status['committee_approved']
         experiment_tracker['attack_blocked'] = bool(
@@ -1651,6 +2171,27 @@ def train(
                         bias_grad,
                         img_list_by_user.get(int(user_idx[m]), []),
                     )
+                    if metrics_logger is not None:
+                        for raw_row in user_metrics.get('_raw_rows', []):
+                            metrics_logger.write('reconstruction_raw', {
+                                'epoch': int(epoch),
+                                'user_id': int(user_idx[m]),
+                                **raw_row,
+                            })
+                        diagnostics = user_metrics.get('_noise_dp_diagnostics', {})
+                        metrics_logger.write('noise_dp_raw', {
+                            'epoch': int(epoch),
+                            'dp_mode': cfg.get('dp_mode', 'none'),
+                            'noise_multiplier': cfg.get('noise_multiplier', ''),
+                            'clip_norm': cfg.get('clip_norm', ''),
+                            'clipping_enabled': cfg.get('clip_norm') not in (None, ''),
+                            'number_clipped_updates': '',
+                            'fraction_clipped': '',
+                            'estimated_noise_std': cfg.get('noise_multiplier', ''),
+                            'attack_side_noise_amount': cfg.get('attack_noise_amount', 0.0),
+                            'attack_side_noise_std': cfg.get('attack_noise_amount', 0.0),
+                            **diagnostics,
+                        })
                     round_reconstruction_metrics = merge_reconstruction_metrics(
                         round_reconstruction_metrics,
                         user_metrics,
@@ -1728,6 +2269,7 @@ def train(
         'committee_enabled': committee_enabled(),
         'committee_approved_this_epoch': committee_status['committee_approved'],
         'candidate_rejected_this_epoch': committee_status['candidate_rejected'],
+        'round_skipped': False,
     }
 
 
@@ -1737,18 +2279,32 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
     avg_pearson = []
     num_recovered = 0
     threshold = float(safe_cfg_get('recovered_pearson_threshold', default=0.98))
+    raw_rows = []
+    eps = 1.0e-8
+    bias_abs = torch.abs(bias_grad.detach().float()).flatten()
+    weight_abs = torch.abs(weight_grad.detach().float()).flatten()
+    diagnostics = {
+        'bias_grad_abs_min': float(torch.min(bias_abs).item()) if bias_abs.numel() else 0.0,
+        'bias_grad_abs_median': float(torch.median(bias_abs).item()) if bias_abs.numel() else 0.0,
+        'bias_grad_abs_mean': float(torch.mean(bias_abs).item()) if bias_abs.numel() else 0.0,
+        'bias_grad_abs_max': float(torch.max(bias_abs).item()) if bias_abs.numel() else 0.0,
+        'weight_grad_abs_mean': float(torch.mean(weight_abs).item()) if weight_abs.numel() else 0.0,
+        'weight_grad_abs_median': float(torch.median(weight_abs).item()) if weight_abs.numel() else 0.0,
+        'denominator_near_zero_count': int(torch.sum(bias_abs < eps).item()) if bias_abs.numel() else 0,
+        'denominator_near_zero_threshold': eps,
+    }
 
-    for elem in img_list:
+    for sample_rank, elem in enumerate(img_list):
         elem_extracted = elem[0].to(cfg["device"])
         max_pearson = 0.0
         max_ssim = 0.0
         max_psnr = 0.0
         pearson = PearsonCorrCoef().to(cfg["device"])
         best_partial_recon = None
+        best_node_id = ''
 
         for i in range(weight_grad.size()[0]):
             denom = bias_grad[i]
-            eps = 1.0e-8
             if torch.abs(denom).item() < eps:
                 continue
 
@@ -1765,9 +2321,21 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
             max_pearson = max(max_pearson, pearson_coef)
             if max_pearson == pearson_coef:
                 best_partial_recon = partial_recon
+                best_node_id = int(i)
 
         if max_pearson >= threshold:
             num_recovered += 1
+        raw_rows.append({
+            'sample_id': sample_rank,
+            'label': '',
+            'pearson': max_pearson,
+            'psnr': max_psnr,
+            'recovered_bool': bool(max_pearson >= threshold),
+            'reconstruction_rank': sample_rank,
+            'layer_id': 'layers.0',
+            'node_id': best_node_id,
+            'row_id': best_node_id,
+        })
         avg_ssim.append(max_ssim)
         avg_psnr.append(max_psnr)
         avg_pearson.append(max_pearson)
@@ -1776,14 +2344,25 @@ def reconstruct_image(weight_grad, bias_grad, img_list):
         _ = best_partial_recon.reshape(elem_extracted.size())
 
     if len(avg_pearson) == 0:
-        return empty_reconstruction_metrics()
+        metrics = empty_reconstruction_metrics()
+        metrics['_raw_rows'] = raw_rows
+        metrics['_noise_dp_diagnostics'] = diagnostics
+        return metrics
 
     return {
         'best_pearson': max(avg_pearson),
         'avg_pearson': sum(avg_pearson) / len(avg_pearson),
+        'median_pearson': median_or_zero(avg_pearson),
+        'std_pearson': std_or_zero(avg_pearson),
         'best_psnr': max(avg_psnr),
         'avg_psnr': sum(avg_psnr) / len(avg_psnr),
+        'median_psnr': median_or_zero(avg_psnr),
+        'std_psnr': std_or_zero(avg_psnr),
         'num_recovered': num_recovered,
+        'num_attempted_reconstructions': len(avg_pearson),
+        'recovered_threshold': threshold,
+        '_raw_rows': raw_rows,
+        '_noise_dp_diagnostics': diagnostics,
     }
 
 
